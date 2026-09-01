@@ -149,11 +149,40 @@ $total_guru_admin = $total_guru_global;
 $total_mapel_admin = 0;
 $total_jurusan_admin = 0;
 $total_bahan_admin = 0;
+$siswa_per_jurusan_admin = [];
+$max_siswa_jurusan = 1;
+$recent_guru_admin = [];
+$recent_siswa_admin = [];
 
 if ($nav_role === 'admin') {
     try { $total_mapel_admin = (int)$pdo->query("SELECT COUNT(*) FROM mapel")->fetchColumn(); } catch (Exception $e) { $total_mapel_admin = 0; }
     try { $total_jurusan_admin = (int)$pdo->query("SELECT COUNT(*) FROM jurusan")->fetchColumn(); } catch (Exception $e) { $total_jurusan_admin = 0; }
     try { $total_bahan_admin = (int)$pdo->query("SELECT COUNT(*) FROM bahan_ajar")->fetchColumn(); } catch (Exception $e) { $total_bahan_admin = 0; }
+
+    try {
+        $stmtJur = $pdo->query("SELECT j.nama_jurusan, COUNT(DISTINCT s.nis) as total 
+                                FROM jurusan j 
+                                LEFT JOIN siswa s ON j.id_jurusan = s.id_jurusan 
+                                GROUP BY j.id_jurusan, j.nama_jurusan 
+                                ORDER BY total DESC");
+        $siswa_per_jurusan_admin = $stmtJur->fetchAll(PDO::FETCH_ASSOC);
+        foreach ($siswa_per_jurusan_admin as $sj) {
+            if ((int)$sj['total'] > $max_siswa_jurusan) {
+                $max_siswa_jurusan = (int)$sj['total'];
+            }
+        }
+    } catch (Exception $e) { $siswa_per_jurusan_admin = []; }
+
+    try {
+        $recent_guru_admin = $pdo->query("SELECT nip, nama_guru, nama_mapel FROM guru ORDER BY nip ASC LIMIT 6")->fetchAll(PDO::FETCH_ASSOC);
+    } catch (Exception $e) { $recent_guru_admin = []; }
+
+    try {
+        $recent_siswa_admin = $pdo->query("SELECT DISTINCT s.nis, s.nama_siswa, s.kelas, j.nama_jurusan 
+                                          FROM siswa s 
+                                          LEFT JOIN jurusan j ON s.id_jurusan = j.id_jurusan 
+                                          ORDER BY s.nis ASC LIMIT 6")->fetchAll(PDO::FETCH_ASSOC);
+    } catch (Exception $e) { $recent_siswa_admin = []; }
 }
 
 // ================= DATA ROLE: SISWA =================
@@ -161,13 +190,33 @@ $siswa_data = null;
 $total_tugas_siswa = 0;
 $total_pelajaran_siswa = 0;
 $total_bahan_siswa = 0;
+$siswa_nilai_list = [];
+$total_nilai_siswa = 0;
+$avg_nilai_siswa = 0;
+$total_tuntas_siswa = 0;
+$total_remedial_siswa = 0;
+$tugas_siswa_list = [];
+$total_tugas_selesai_siswa = 0;
+$bahan_siswa_list = [];
+$wali_kelas_siswa = '-';
 
 if ($nav_role === 'siswa') {
-    try {
-        $stmt = $pdo->prepare("SELECT s.nis, s.nama_siswa, s.kelas, s.id_jurusan, j.nama_jurusan FROM siswa s LEFT JOIN jurusan j ON s.id_jurusan = j.id_jurusan WHERE LOWER(s.nama_siswa) = LOWER(:nama) LIMIT 1");
-        $stmt->execute([':nama' => $user_display_name]);
-        $siswa_data = $stmt->fetch(PDO::FETCH_ASSOC);
-    } catch (Exception $e) {}
+    $session_nis = $_SESSION['nis'] ?? null;
+    if ($session_nis) {
+        try {
+            $stmt = $pdo->prepare("SELECT s.nis, s.nama_siswa, s.kelas, s.id_jurusan, j.nama_jurusan, s.nip FROM siswa s LEFT JOIN jurusan j ON s.id_jurusan = j.id_jurusan WHERE s.nis = :nis LIMIT 1");
+            $stmt->execute([':nis' => $session_nis]);
+            $siswa_data = $stmt->fetch(PDO::FETCH_ASSOC);
+        } catch (Exception $e) {}
+    }
+
+    if (!$siswa_data) {
+        try {
+            $stmt = $pdo->prepare("SELECT s.nis, s.nama_siswa, s.kelas, s.id_jurusan, j.nama_jurusan, s.nip FROM siswa s LEFT JOIN jurusan j ON s.id_jurusan = j.id_jurusan WHERE LOWER(s.nama_siswa) = LOWER(:nama) LIMIT 1");
+            $stmt->execute([':nama' => $user_display_name]);
+            $siswa_data = $stmt->fetch(PDO::FETCH_ASSOC);
+        } catch (Exception $e) {}
+    }
 
     try { $total_tugas_siswa = (int)$pdo->query("SELECT COUNT(*) FROM tugas")->fetchColumn(); } catch (Exception $e) { $total_tugas_siswa = 0; }
 
@@ -183,6 +232,74 @@ if ($nav_role === 'siswa') {
             $stmt->execute([':j' => $siswa_data['id_jurusan']]);
             $total_bahan_siswa = (int)$stmt->fetchColumn();
         } catch (Exception $e) { $total_bahan_siswa = 0; }
+    }
+
+    if ($siswa_data && !empty($siswa_data['nis'])) {
+        $nis_curr = $siswa_data['nis'];
+
+        if (!empty($siswa_data['nip'])) {
+            try {
+                $stmtWali = $pdo->prepare("SELECT nama_guru FROM guru WHERE nip = :nip LIMIT 1");
+                $stmtWali->execute([':nip' => $siswa_data['nip']]);
+                $wali_kelas_siswa = $stmtWali->fetchColumn() ?: '-';
+            } catch (Exception $e) {}
+        }
+
+        try {
+            $stmtNilai = $pdo->prepare("SELECT s.id_mapel, m.nama_mapel, s.nilai, g.nama_guru 
+                                        FROM siswa s 
+                                        JOIN mapel m ON s.id_mapel = m.id_mapel 
+                                        LEFT JOIN guru g ON s.nip = g.nip 
+                                        WHERE s.nis = :nis 
+                                        ORDER BY s.nilai DESC");
+            $stmtNilai->execute([':nis' => $nis_curr]);
+            $siswa_nilai_list = $stmtNilai->fetchAll(PDO::FETCH_ASSOC);
+
+            foreach ($siswa_nilai_list as $sn) {
+                $val = (int)$sn['nilai'];
+                $total_nilai_siswa += $val;
+                if ($val >= 75) {
+                    $total_tuntas_siswa++;
+                } else {
+                    $total_remedial_siswa++;
+                }
+            }
+            $count_mapel_siswa = count($siswa_nilai_list);
+            if ($count_mapel_siswa > 0) {
+                $avg_nilai_siswa = round($total_nilai_siswa / $count_mapel_siswa, 1);
+            }
+        } catch (Exception $e) {
+            $siswa_nilai_list = [];
+        }
+
+        try {
+            $stmtTugas = $pdo->prepare("SELECT t.id_tugas, t.judul, t.deadline, m.nama_mapel, 
+                                        (SELECT status FROM pengumpulan_tugas p WHERE p.id_tugas = t.id_tugas AND p.nis = :nis LIMIT 1) as status_kumpul 
+                                        FROM tugas t 
+                                        LEFT JOIN mapel m ON t.id_mapel = m.id_mapel 
+                                        ORDER BY t.deadline ASC LIMIT 6");
+            $stmtTugas->execute([':nis' => $nis_curr]);
+            $tugas_siswa_list = $stmtTugas->fetchAll(PDO::FETCH_ASSOC);
+            foreach ($tugas_siswa_list as $ts) {
+                if (!empty($ts['status_kumpul'])) {
+                    $total_tugas_selesai_siswa++;
+                }
+            }
+        } catch (Exception $e) {
+            $tugas_siswa_list = [];
+        }
+
+        try {
+            $stmtBahan = $pdo->prepare("SELECT b.id_bahan, b.judul_materi, b.file_path, b.tanggal_upload, m.nama_mapel 
+                                        FROM bahan_ajar b 
+                                        LEFT JOIN mapel m ON b.id_mapel = m.id_mapel 
+                                        WHERE b.id_jurusan = :jurusan OR b.id_jurusan IS NULL 
+                                        ORDER BY b.tanggal_upload DESC LIMIT 5");
+            $stmtBahan->execute([':jurusan' => $siswa_data['id_jurusan']]);
+            $bahan_siswa_list = $stmtBahan->fetchAll(PDO::FETCH_ASSOC);
+        } catch (Exception $e) {
+            $bahan_siswa_list = [];
+        }
     }
 }
 ?>
@@ -1683,7 +1800,8 @@ if ($nav_role === 'siswa') {
         </section>
         <?php endif; ?>
 
-        <!-- ===== PIE CHART DISTRIBUSI ANGGOTA SEKOLAH ===== -->
+        <!-- ===== PIE CHART DISTRIBUSI ANGGOTA SEKOLAH (KHUSUS GURU) ===== -->
+        <?php if ($is_guru): ?>
         <div class="content-box">
             <div class="section-title">
                 <span>📊 <span data-translate="pie_title">Distribusi Anggota Sekolah</span></span>
@@ -1743,6 +1861,7 @@ if ($nav_role === 'siswa') {
                 </div>
             </div>
         </div>
+        <?php endif; ?>
 
         <!-- ================= INFORMASI SEKOLAH (UNTUK SEMUA ROLE) ================= -->
         
@@ -1923,7 +2042,25 @@ if ($nav_role === 'siswa') {
                 announcement_1_title: "Jadwal Penilaian Tengah Semester (PTS)",
                 announcement_1_desc: "Diberitahukan kepada seluruh siswa bahwa PTS akan diselenggarakan pekan depan. Pastikan data mata pelajaran Anda telah lengkap.",
                 announcement_2_title: "Pembaruan Data Pokok Guru & Siswa",
-                announcement_2_desc: "Pengisian nilai dan penugasan telah dibuka. Mohon periksa kembali kesesuaian data Anda."
+                announcement_2_desc: "Pengisian nilai dan penugasan telah dibuka. Mohon periksa kembali kesesuaian data Anda.",
+                kpi_tugas_siswa: "Tugas & Praktikum",
+                kpi_mapel_siswa: "Mata Pelajaran",
+                kpi_bahan_siswa: "Modul Bahan Ajar",
+                kpi_nilai_siswa: "Rata-rata Nilai",
+                chart_title_siswa: "Capaian Nilai per Mata Pelajaran",
+                spotlight_tag_siswa: "Identitas & Agenda Siswa",
+                btn_pelajaran_portal: "🚀 Buka Modul & Materi Belajar",
+                sec_bahan_siswa: "Modul Bahan Ajar Terbaru",
+                sec_nilai_siswa: "Nilai Akademik Semester",
+                gauge_title_siswa: "Target Kelulusan & KKM",
+                clock_title_siswa: "Waktu & Sesi Belajar",
+                chart_title_admin: "Distribusi Siswa per Jurusan",
+                spotlight_tag_admin: "Administrator Sistem",
+                btn_admin_portal: "🚀 Buka Manajemen Master Data",
+                sec_guru_admin: "Tenaga Pendidik Terbaru",
+                sec_siswa_admin: "Siswa Terdaftar",
+                gauge_title_admin: "Rasio & Kapasitas Sekolah",
+                clock_title_admin: "Waktu Sistem & Server"
             },
             en: {
                 main_title: "SCHOOL MAIN PORTAL",
@@ -1978,7 +2115,25 @@ if ($nav_role === 'siswa') {
                 announcement_1_title: "Mid-Semester Assessment Schedule",
                 announcement_1_desc: "Students are notified that mid-term exams begin next week. Ensure all course data is up to date.",
                 announcement_2_title: "Master Data Updates for Teachers & Students",
-                announcement_2_desc: "Grading and task submissions are now open. Please review your profile data."
+                announcement_2_desc: "Grading and task submissions are now open. Please review your profile data.",
+                kpi_tugas_siswa: "Tasks & Practicum",
+                kpi_mapel_siswa: "Subjects",
+                kpi_bahan_siswa: "Learning Modules",
+                kpi_nilai_siswa: "Average Grade",
+                chart_title_siswa: "Subject Grade Achievement",
+                spotlight_tag_siswa: "Student Profile & Agenda",
+                btn_pelajaran_portal: "🚀 Open Modules & Lessons",
+                sec_bahan_siswa: "Latest Learning Modules",
+                sec_nilai_siswa: "Semester Academic Grades",
+                gauge_title_siswa: "Graduation Target & Passing Grade",
+                clock_title_siswa: "Study Session Time",
+                chart_title_admin: "Students by Department",
+                spotlight_tag_admin: "System Administrator",
+                btn_admin_portal: "🚀 Open Master Data Management",
+                sec_guru_admin: "Teachers Directory",
+                sec_siswa_admin: "Enrolled Students",
+                gauge_title_admin: "School Ratio & Capacity",
+                clock_title_admin: "Server & System Time"
             },
             jp: {
                 main_title: "学校メインポータル",
@@ -2033,7 +2188,25 @@ if ($nav_role === 'siswa') {
                 announcement_1_title: "中間試験(PTS)日程のお知らせ",
                 announcement_1_desc: "来週より中間試験を実施いたします。履修科目の登録確認を行ってください。",
                 announcement_2_title: "教員・生徒基本データ更新",
-                announcement_2_desc: "生徒および教師データの入力・編集受付を開始しました。"
+                announcement_2_desc: "生徒および教師データの入力・編集受付を開始しました。",
+                kpi_tugas_siswa: "課題・実習",
+                kpi_mapel_siswa: "履修科目",
+                kpi_bahan_siswa: "学習教材モジュール",
+                kpi_nilai_siswa: "平均成績",
+                chart_title_siswa: "科目別成績達成度",
+                spotlight_tag_siswa: "生徒情報と学習予定",
+                btn_pelajaran_portal: "🚀 教材・授業を開く",
+                sec_bahan_siswa: "最新の学習教材",
+                sec_nilai_siswa: "学期成績一覧",
+                gauge_title_siswa: "卒業目標と合格基準",
+                clock_title_siswa: "学習セッション時間",
+                chart_title_admin: "学科別生徒分布",
+                spotlight_tag_admin: "システム管理者",
+                btn_admin_portal: "🚀 マスターデータ管理を開く",
+                sec_guru_admin: "教師名簿",
+                sec_siswa_admin: "登録生徒",
+                gauge_title_admin: "学校収容率と比率",
+                clock_title_admin: "サーバー・システム時間"
             },
             kr: {
                 main_title: "학교 메인 포털",
@@ -2088,7 +2261,25 @@ if ($nav_role === 'siswa') {
                 announcement_1_title: "중간고사(PTS) 실시 안내",
                 announcement_1_desc: "다음 주 중간고사 실시 전에 모든 학생은 수강 과목 데이터를 업데이트해 주시기 바랍니다.",
                 announcement_2_title: "교사 및 학생 기본 데이터 업데이트",
-                announcement_2_desc: "11학년 학생 및 교사 데이터의 입력 및 편집이 학생 데이터 및 교사 데이터 메뉴를 통해 시작되었습니다."
+                announcement_2_desc: "11학년 학생 및 교사 데이터의 입력 및 편집이 학생 데이터 및 교사 데이터 메뉴를 통해 시작되었습니다.",
+                kpi_tugas_siswa: "과제 및 실습",
+                kpi_mapel_siswa: "이수 과목",
+                kpi_bahan_siswa: "학습 교재 모듈",
+                kpi_nilai_siswa: "평균 성적",
+                chart_title_siswa: "과목별 성적 달성도",
+                spotlight_tag_siswa: "학생 프로필 및 일정",
+                btn_pelajaran_portal: "🚀 학습 모듈 및 수업 열기",
+                sec_bahan_siswa: "최신 학습 교재",
+                sec_nilai_siswa: "학기 성적 현황",
+                gauge_title_siswa: "수료 목표 및 통과 기준",
+                clock_title_siswa: "학습 세션 시간",
+                chart_title_admin: "학과별 학생 분포",
+                spotlight_tag_admin: "시스템 관리자",
+                btn_admin_portal: "🚀 마스터 데이터 관리 열기",
+                sec_guru_admin: "교원 현황",
+                sec_siswa_admin: "등록 학생",
+                gauge_title_admin: "학교 정원 및 수용 비율",
+                clock_title_admin: "서버 및 시스템 시간"
             }
         };
 

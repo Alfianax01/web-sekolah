@@ -159,12 +159,12 @@ if (isset($_GET['status'])) {
 }
 
 // ==========================================
-// 3. DATA REFERENSI
+// 3. MASTER DATA UNTUK DROPDOWN
 // ==========================================
-$stmt_jurusan = $pdo->query("SELECT * FROM jurusan ORDER BY nama_jurusan ASC");
+$stmt_jurusan = $pdo->query("SELECT id_jurusan, nama_jurusan FROM jurusan ORDER BY nama_jurusan ASC");
 $jurusan_list = $stmt_jurusan->fetchAll(PDO::FETCH_ASSOC);
 
-$stmt_mapel = $pdo->query("SELECT * FROM mapel ORDER BY nama_mapel ASC");
+$stmt_mapel = $pdo->query("SELECT id_mapel, nama_mapel, id_jurusan FROM mapel ORDER BY nama_mapel ASC");
 $mapel_list = $stmt_mapel->fetchAll(PDO::FETCH_ASSOC);
 
 $stmt_guru = $pdo->query("SELECT nip, nama_guru FROM guru ORDER BY nama_guru ASC");
@@ -174,7 +174,7 @@ $stmt_kelas_all = $pdo->query("SELECT DISTINCT kelas FROM siswa WHERE kelas IS N
 $kelas_list = $stmt_kelas_all->fetchAll(PDO::FETCH_COLUMN);
 
 // ==========================================
-// 4. QUERY READ + FILTER + SEARCH + PAGINASI (5 SISWA/HALAMAN)
+// 4. QUERY READ + FILTER + SEARCH + PAGINASI
 // ==========================================
 $filter_jurusan = $_GET['filter_jurusan'] ?? '';
 $filter_kelas   = $_GET['filter_kelas'] ?? '';
@@ -210,36 +210,66 @@ if ($page > $total_pages) $page = $total_pages;
 
 $offset = ($page - 1) * $per_page;
 
-$sql_siswa = "SELECT s.nis, s.nama_siswa, s.kelas, s.id_jurusan, j.nama_jurusan
-              FROM siswa s
-              LEFT JOIN jurusan j ON s.id_jurusan = j.id_jurusan
-              $where
-              GROUP BY s.nis, s.nama_siswa, s.kelas, s.id_jurusan, j.nama_jurusan
-              ORDER BY s.kelas ASC, s.nama_siswa ASC, s.nis ASC
-              LIMIT :offset, :per_page";
-
-$stmt = $pdo->prepare($sql_siswa);
-foreach ($params as $key => $val) {
-    $stmt->bindValue($key, $val);
+$sql_nis = "SELECT DISTINCT s.nis 
+            FROM siswa s 
+            $where 
+            ORDER BY s.nis ASC 
+            LIMIT :limit OFFSET :offset";
+$stmt_nis = $pdo->prepare($sql_nis);
+foreach ($params as $k => $v) {
+    $stmt_nis->bindValue($k, $v);
 }
-$stmt->bindValue(':offset', $offset, PDO::PARAM_INT);
-$stmt->bindValue(':per_page', $per_page, PDO::PARAM_INT);
-$stmt->execute();
-$siswa_list = $stmt->fetchAll(PDO::FETCH_ASSOC);
+$stmt_nis->bindValue(':limit', $per_page, PDO::PARAM_INT);
+$stmt_nis->bindValue(':offset', $offset, PDO::PARAM_INT);
+$stmt_nis->execute();
+$nis_page_list = $stmt_nis->fetchAll(PDO::FETCH_COLUMN);
 
 $daftar_siswa = [];
-foreach ($siswa_list as $row) {
-    $stmt_nilai = $pdo->prepare("SELECT m.nama_mapel, s.nilai, s.id_mapel
-                                 FROM siswa s
-                                 JOIN mapel m ON s.id_mapel = m.id_mapel
-                                 WHERE s.nis = :nis
-                                 ORDER BY m.nama_mapel ASC
-                                 LIMIT 5");
-    $stmt_nilai->execute([':nis' => $row['nis']]);
-    $nilai_mapel = $stmt_nilai->fetchAll(PDO::FETCH_ASSOC);
-    $nilai_padded = array_pad($nilai_mapel, 5, null);
-    $row['nilai_list'] = $nilai_padded;
-    $daftar_siswa[] = $row;
+if (!empty($nis_page_list)) {
+    $in_placeholders = implode(',', array_fill(0, count($nis_page_list), '?'));
+    $sql_detail = "SELECT s.nis, s.nama_siswa, s.ttl, s.kelas, s.id_jurusan, j.nama_jurusan,
+                          s.id_mapel, m.nama_mapel, s.nip, g.nama_guru, s.nilai
+                   FROM siswa s
+                   LEFT JOIN jurusan j ON s.id_jurusan = j.id_jurusan
+                   LEFT JOIN mapel m ON s.id_mapel = m.id_mapel
+                   LEFT JOIN guru g ON s.nip = g.nip
+                   WHERE s.nis IN ($in_placeholders)
+                   ORDER BY s.nis ASC, s.id_mapel ASC";
+    $stmt_detail = $pdo->prepare($sql_detail);
+    $stmt_detail->execute($nis_page_list);
+    $all_rows = $stmt_detail->fetchAll(PDO::FETCH_ASSOC);
+
+    $grouped = [];
+    foreach ($all_rows as $r) {
+        $nis = $r['nis'];
+        if (!isset($grouped[$nis])) {
+            $grouped[$nis] = [
+                'nis'          => $r['nis'],
+                'nama_siswa'   => $r['nama_siswa'],
+                'ttl'          => $r['ttl'],
+                'kelas'        => $r['kelas'],
+                'id_jurusan'   => $r['id_jurusan'],
+                'nama_jurusan' => $r['nama_jurusan'],
+                'nilai_mapel'  => []
+            ];
+        }
+        if (!empty($r['id_mapel'])) {
+            $grouped[$nis]['nilai_mapel'][] = [
+                'id_mapel'   => $r['id_mapel'],
+                'nama_mapel' => $r['nama_mapel'] ?? $r['id_mapel'],
+                'nip'        => $r['nip'],
+                'nama_guru'  => $r['nama_guru'],
+                'nilai'      => $r['nilai']
+            ];
+        }
+    }
+
+    foreach ($grouped as $nis => $item) {
+        $nilai_mapel = array_slice($item['nilai_mapel'], 0, 5);
+        $nilai_padded = array_pad($nilai_mapel, 5, null);
+        $item['nilai_list'] = $nilai_padded;
+        $daftar_siswa[] = $item;
+    }
 }
 
 // User Info
@@ -261,7 +291,7 @@ if ($user_id) {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Data Nilai Siswa - Portal Akademik</title>
+    <title>Data Siswa - Portal Akademik</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -273,6 +303,7 @@ if ($user_id) {
             --accent-hover: #1d4ed8;
             --accent-green: #10b981;
             --accent-amber: #f59e0b;
+            --accent-purple: #8b5cf6;
             --accent-rose: #ef4444;
             --bg-main: #f8fafc;
             --bg-card: #ffffff;
@@ -292,7 +323,6 @@ if ($user_id) {
         * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Plus Jakarta Sans', 'Segoe UI', sans-serif; }
         body { background-color: var(--bg-main); color: var(--text-main); line-height: 1.6; }
 
-        /* HEADER */
         .header-main { display: flex; align-items: stretch; background: #ffffff; border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 100; }
         .header-accent-line { width: 6px; background-color: var(--accent); flex-shrink: 0; }
         .header-content { flex: 1; display: flex; justify-content: space-between; align-items: center; padding: 14px 40px; max-width: 1440px; margin: 0 auto; gap: 20px; }
@@ -306,7 +336,6 @@ if ($user_id) {
         .user-role { color: var(--primary); font-size: 12px; font-weight: 700; text-transform: uppercase; }
         .user-status { color: var(--accent-green); font-size: 10px; font-weight: 600; }
 
-        /* NAVBAR */
         .navbar-menu { background-color: var(--primary); width: 100%; box-shadow: inset 0 -3px 0 rgba(0,0,0,0.1); }
         .navbar-inner { max-width: 1440px; margin: 0 auto; padding: 0 40px; }
         .navbar-menu ul { list-style: none; display: flex; align-items: center; gap: 2px; overflow-x: auto; }
@@ -315,7 +344,6 @@ if ($user_id) {
         .navbar-menu a.nav-link.active { color: white; border-bottom-color: var(--accent); background-color: rgba(255, 255, 255, 0.05); }
         .navbar-menu a.nav-link.nav-logout { color: #fca5a5; margin-left: auto; }
 
-        /* MAIN CONTAINER */
         .main-container { max-width: 1440px; margin: 26px auto 50px; padding: 0 40px; }
         .page-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; flex-wrap: wrap; gap: 12px; }
         .page-header h2 { font-size: 20px; font-weight: 800; color: var(--text-title); }
@@ -329,91 +357,49 @@ if ($user_id) {
         .btn-action { display: inline-flex; align-items: center; gap: 6px; padding: 9px 18px; border-radius: var(--radius-sm); font-size: 13px; font-weight: 700; border: none; cursor: pointer; text-decoration: none; transition: all 0.2s; }
         .btn-primary { background: var(--accent); color: #fff; }
         .btn-primary:hover { background: var(--accent-hover); }
-        .btn-secondary { background: var(--bg-subtle); color: var(--text-body); border: 1px solid var(--border); }
+        .btn-secondary { background: var(--bg-subtle); color: var(--text-main); border: 1px solid var(--border); }
 
-        /* TABLE */
-        .toolbar-box { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
-        .filter-group { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
         .table-responsive { width: 100%; overflow-x: auto; }
         .table-custom { width: 100%; border-collapse: collapse; text-align: left; }
         .table-custom th { background: var(--bg-subtle); padding: 12px 14px; font-size: 12px; font-weight: 700; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid var(--border); }
-        .table-custom td { padding: 12px 14px; font-size: 13px; color: var(--text-body); border-bottom: 1px solid var(--border); vertical-align: middle; }
+        .table-custom td { padding: 12px 14px; font-size: 13px; color: var(--text-main); border-bottom: 1px solid var(--border); vertical-align: middle; }
         .table-custom tr:hover { background-color: #fcfdfe; }
 
         .badge-pill { display: inline-block; padding: 3px 9px; border-radius: 20px; font-size: 11.5px; font-weight: 700; }
-        .badge-blue { background: #eff6ff; color: #1d4ed8; border: 1px solid #bfdbfe; }
         .badge-purple { background: #faf5ff; color: #7e22ce; border: 1px solid #e9d5ff; }
-        .badge-score-high { background: #ecfdf5; color: #047857; font-weight: 800; }
-        .badge-score-mid { background: #fefce8; color: #a16207; font-weight: 800; }
-        .badge-score-low { background: #fef2f2; color: #b91c1c; font-weight: 800; }
+        .badge-blue { background: #eff6ff; color: #1d4ed8; border: 1px solid #bfdbfe; }
+        .badge-score-high { background: #f0fdf4; color: #166534; border: 1px solid #bbf7d0; }
+        .badge-score-mid  { background: #fefce8; color: #854d0e; border: 1px solid #fef08a; }
+        .badge-score-low  { background: #fef2f2; color: #991b1b; border: 1px solid #fecaca; }
 
         .btn-tbl { padding: 5px 10px; border-radius: var(--radius-sm); font-size: 11.5px; font-weight: 700; text-decoration: none; display: inline-flex; align-items: center; gap: 4px; border: 1px solid transparent; cursor: pointer; }
         .btn-tbl-edit { background: #eff6ff; color: #1d4ed8; border-color: #bfdbfe; }
         .btn-tbl-delete { background: #fef2f2; color: #b91c1c; border-color: #fecaca; }
 
+        .form-control { width: 100%; height: 40px; padding: 0 12px; font-size: 13px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: #ffffff; color: var(--text-title); outline: none; transition: all 0.2s; }
+        .form-control:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1); }
+
         .pagination { display: flex; align-items: center; justify-content: center; gap: 6px; margin-top: 20px; }
-        .page-link { padding: 6px 12px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: #ffffff; color: var(--text-body); font-size: 12.5px; font-weight: 700; text-decoration: none; }
+        .page-link { padding: 6px 12px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: #ffffff; color: var(--text-main); font-size: 12.5px; font-weight: 700; text-decoration: none; }
         .page-link:hover { background: var(--bg-subtle); color: var(--accent); }
         .page-link.active { background: var(--accent); color: #ffffff; border-color: var(--accent); }
 
-        /* MODAL */
-        .modal-overlay {
-            position: fixed;
-            inset: 0;
-            background: rgba(15, 23, 42, 0.6);
-            backdrop-filter: blur(4px);
-            display: none;
-            align-items: center;
-            justify-content: center;
-            z-index: 1000;
-            padding: 20px;
-            animation: fadeIn 0.2s ease;
-        }
+        /* ===== MODAL POPUP SYSTEM ===== */
+        .modal-overlay { position: fixed; inset: 0; background: rgba(15, 23, 42, 0.6); backdrop-filter: blur(4px); display: none; align-items: center; justify-content: center; z-index: 1000; padding: 20px; animation: fadeIn 0.2s ease; }
         .modal-overlay.active { display: flex; }
-
-        .modal-card {
-            background: #ffffff;
-            width: 100%;
-            max-width: 620px;
-            border-radius: var(--radius-lg);
-            box-shadow: var(--shadow-modal);
-            border: 1px solid var(--border);
-            overflow: hidden;
-            animation: slideUp 0.25s ease;
-        }
-        .modal-card-sm { max-width: 440px; }
-
-        .modal-header {
-            padding: 16px 24px;
-            background: #ffffff;
-            border-bottom: 1px solid var(--border);
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-        }
+        .modal-card { background: #ffffff; width: 100%; max-width: 600px; border-radius: var(--radius-lg); box-shadow: var(--shadow-modal); border: 1px solid var(--border); overflow: hidden; animation: slideUp 0.25s ease; }
+        .modal-card-sm { max-width: 400px; }
+        .modal-header { padding: 16px 24px; background: #ffffff; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
         .modal-header h3 { font-size: 16px; font-weight: 800; color: var(--text-title); display: flex; align-items: center; gap: 8px; }
-        .modal-close-btn {
-            background: none; border: none; font-size: 20px; color: var(--text-muted); cursor: pointer; padding: 4px; line-height: 1; border-radius: 4px;
-        }
+        .modal-close-btn { background: none; border: none; font-size: 20px; color: var(--text-muted); cursor: pointer; padding: 4px; line-height: 1; border-radius: 4px; }
         .modal-close-btn:hover { color: var(--text-title); background: var(--bg-subtle); }
-
-        .modal-body { padding: 22px 24px; }
-        .modal-footer {
-            padding: 14px 24px;
-            background: var(--bg-subtle);
-            border-top: 1px solid var(--border);
-            display: flex;
-            align-items: center;
-            justify-content: flex-end;
-            gap: 10px;
-        }
-
-        .form-grid-modal { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
-        .form-group-modal { margin-bottom: 10px; }
+        .modal-body { padding: 22px 24px; max-height: 75vh; overflow-y: auto; }
+        .modal-footer { padding: 14px 24px; background: var(--bg-subtle); border-top: 1px solid var(--border); display: flex; align-items: center; justify-content: flex-end; gap: 10px; }
+        
+        .form-grid-modal { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; }
+        .form-group-modal { margin-bottom: 0; }
         .form-group-modal.full { grid-column: span 2; }
         .form-label { display: block; font-size: 12.5px; font-weight: 700; color: var(--text-title); margin-bottom: 5px; }
-        .form-control { width: 100%; height: 38px; padding: 0 12px; font-size: 13px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: #ffffff; outline: none; }
-        .form-control:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1); }
 
         @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
         @keyframes slideUp { from { transform: translateY(16px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
@@ -480,7 +466,6 @@ if ($user_id) {
             .header-date { font-size: 11px; padding: 4px 10px; }
             .main-container { padding: 0 14px; margin: 16px auto 36px; }
 
-            /* SIDEBAR DRAWER */
             .navbar-menu {
                 position: fixed;
                 top: 0;
@@ -575,29 +560,8 @@ if ($user_id) {
             .page-header .btn-action { width: 100%; justify-content: center; }
 
             .content-box { padding: 16px 14px; }
-            .toolbar-box {
-                flex-direction: column;
-                align-items: stretch;
-                gap: 12px;
-            }
-            .filter-group {
-                flex-direction: column;
-                align-items: stretch;
-                width: 100%;
-                gap: 8px;
-            }
-            .filter-group select.form-control { width: 100% !important; }
-            .toolbar-box form,
-            .toolbar-box > div {
-                width: 100%;
-                display: flex;
-                flex-wrap: wrap;
-                gap: 8px;
-            }
-            .toolbar-box input.form-control {
-                flex: 1 1 140px;
-                width: auto !important;
-            }
+            .form-grid-modal { grid-template-columns: 1fr; }
+            .form-group-modal.full { grid-column: span 1; }
 
             .modal-overlay { padding: 12px; }
             .modal-card, .modal-card-sm {
@@ -618,8 +582,6 @@ if ($user_id) {
                 width: 100%;
                 justify-content: center;
             }
-            .form-grid-modal { grid-template-columns: 1fr !important; }
-            .form-group-modal.full { grid-column: span 1 !important; }
         }
     </style>
 </head>
@@ -677,12 +639,17 @@ if ($user_id) {
             </div>
             <ul>
                 <li><a href="index.php" class="nav-link">Beranda</a></li>
-                <li><a href="siswa.php" class="nav-link active">Data Siswa</a></li>
-                <li><a href="guru.php" class="nav-link">Data Guru</a></li>
-                <li><a href="mapel.php" class="nav-link">Data Mapel</a></li>
-                <li><a href="jurusan.php" class="nav-link">Data Jurusan</a></li>
-                <li><a href="bahan_ajar.php" class="nav-link">Bahan Ajar</a></li>
+                <?php if ($nav_role !== 'siswa'): ?>
+                    <li><a href="siswa.php" class="nav-link active">Data Siswa</a></li>
+                    <li><a href="guru.php" class="nav-link">Data Guru</a></li>
+                    <li><a href="mapel.php" class="nav-link">Data Mapel</a></li>
+                    <li><a href="jurusan.php" class="nav-link">Data Jurusan</a></li>
+                    <li><a href="bahan_ajar.php" class="nav-link">Bahan Ajar</a></li>
+                <?php endif; ?>
                 <li><a href="tugas.php" class="nav-link">Tugas</a></li>
+                <?php if ($nav_role === 'siswa'): ?>
+                    <li><a href="pelajaran.php" class="nav-link">Pelajaran</a></li>
+                <?php endif; ?>
                 <li><a href="profile.php" class="nav-link">Profil Saya</a></li>
                 <li><a href="logout.php" class="nav-link nav-logout">Logout</a></li>
             </ul>
@@ -694,32 +661,34 @@ if ($user_id) {
 
         <div class="page-header">
             <div>
-                <h2>📋 Nilai Siswa (5 Nilai Per Siswa)</h2>
-                <p>Menampilkan maksimal 5 nilai beserta nama mata pelajaran untuk setiap siswa. Halaman menampilkan 5 siswa.</p>
+                <h2>👨‍🎓 Kelola Data & Nilai Siswa</h2>
+                <p>Manajemen data siswa, NIS, kelas, jurusan, serta rekap 5 nilai mata pelajaran utama.</p>
             </div>
+            <?php if ($nav_role !== 'siswa'): ?>
             <div>
                 <button type="button" class="btn-action btn-primary" onclick="openAddModal()">
-                    ➕ Tambah Nilai
+                    ➕ Tambah Nilai Baru
                 </button>
             </div>
+            <?php endif; ?>
         </div>
 
         <?php if ($msg_success): ?>
             <div class="alert-box success">✅ <?php echo htmlspecialchars($msg_success); ?></div>
         <?php endif; ?>
+
         <?php if ($msg_error): ?>
             <div class="alert-box error">⚠️ <?php echo htmlspecialchars($msg_error); ?></div>
         <?php endif; ?>
 
-        <!-- KONTEN TABEL -->
+        <!-- TABEL DATA SISWA -->
         <div class="content-box">
             
-            <!-- Toolbar: Filter, Search, Total -->
-            <form action="siswa.php" method="GET" class="toolbar-box">
-                <div class="filter-group">
-                    <span style="font-size: 14px; font-weight: 700; color: var(--text-title);">
-                        Total Siswa: <strong><?php echo $total_data; ?></strong>
-                    </span>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; flex-wrap: wrap; gap: 10px;">
+                <form action="siswa.php" method="GET" style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+                    <div style="font-size: 14px; font-weight: 700; color: var(--text-title); margin-right: 6px;">
+                        Total Siswa: <strong><?php echo $total_data; ?> Siswa</strong>
+                    </div>
                     <select name="filter_jurusan" class="form-control" style="width: auto; height: 36px;" onchange="this.form.submit()">
                         <option value="">Semua Jurusan</option>
                         <?php foreach ($jurusan_list as $j): ?>
@@ -736,16 +705,18 @@ if ($user_id) {
                             </option>
                         <?php endforeach; ?>
                     </select>
-                </div>
+                </form>
 
-                <div style="display: flex; gap: 8px;">
+                <form action="siswa.php" method="GET" style="display: flex; gap: 8px;">
+                    <input type="hidden" name="filter_jurusan" value="<?php echo htmlspecialchars($filter_jurusan); ?>">
+                    <input type="hidden" name="filter_kelas" value="<?php echo htmlspecialchars($filter_kelas); ?>">
                     <input type="text" name="search" class="form-control" style="width: 220px; height: 36px;" placeholder="Cari NIS, Nama, Kelas..." value="<?php echo htmlspecialchars($search); ?>">
                     <button type="submit" class="btn-action btn-primary" style="padding: 6px 14px; font-size: 12.5px;">Cari</button>
                     <?php if ($filter_jurusan || $filter_kelas || $search): ?>
                         <a href="siswa.php" class="btn-action btn-secondary" style="padding: 6px 12px; font-size: 12.5px;">Reset</a>
                     <?php endif; ?>
-                </div>
-            </form>
+                </form>
+            </div>
 
             <div class="table-responsive">
                 <table class="table-custom">
@@ -760,7 +731,9 @@ if ($user_id) {
                             <th>Nilai 3</th>
                             <th>Nilai 4</th>
                             <th>Nilai 5</th>
-                            <th style="text-align: center;">Aksi</th>
+                            <?php if ($nav_role !== 'siswa'): ?>
+                            <th style="text-align: right;">Aksi</th>
+                            <?php endif; ?>
                         </tr>
                     </thead>
                     <tbody>
@@ -787,23 +760,25 @@ if ($user_id) {
                                             <?php endif; ?>
                                         </td>
                                     <?php endforeach; ?>
-                                    <td style="text-align: center; white-space: nowrap;">
+                                    <?php if ($nav_role !== 'siswa'): ?>
+                                    <td style="text-align: right; white-space: nowrap;">
                                         <button type="button" class="btn-tbl btn-tbl-edit" 
                                                 onclick="openEditSiswaModal(<?php echo htmlspecialchars(json_encode($row)); ?>)">
                                             ✏️ Edit
                                         </button>
                                         <?php if ($nav_role === 'admin'): ?>
                                             <button type="button" class="btn-tbl btn-tbl-delete" 
-                                                    onclick="openDeleteSiswaModal('<?php echo htmlspecialchars($row['nis']); ?>', '<?php echo htmlspecialchars(addslashes($row['nama_siswa'])); ?>')">
+                                                    onclick="openDeleteSiswaModal('<?php echo htmlspecialchars(addslashes($row['nis'])); ?>', '<?php echo htmlspecialchars(addslashes($row['nama_siswa'])); ?>')">
                                                 🗑️ Hapus
                                             </button>
                                         <?php endif; ?>
                                     </td>
+                                    <?php endif; ?>
                                 </tr>
                             <?php endforeach; ?>
                         <?php else: ?>
                             <tr>
-                                <td colspan="10" style="text-align: center; padding: 28px; color: var(--text-muted);">
+                                <td colspan="<?php echo ($nav_role !== 'siswa') ? 10 : 9; ?>" style="text-align: center; padding: 28px; color: var(--text-muted);">
                                     Tidak ada data siswa yang ditemukan.
                                 </td>
                             </tr>
@@ -812,7 +787,7 @@ if ($user_id) {
                 </table>
             </div>
 
-            <!-- Paginasi -->
+            <!-- PAGINASI -->
             <?php if ($total_pages > 1): ?>
                 <div class="pagination">
                     <?php if ($page > 1): ?>
@@ -828,6 +803,7 @@ if ($user_id) {
                     <?php endif; ?>
                 </div>
             <?php endif; ?>
+
         </div>
 
     </main>
@@ -870,7 +846,6 @@ if ($user_id) {
                                     </option>
                                 <?php endforeach; ?>
                             </select>
-                            <input type="hidden" name="id_mapel_hidden" id="form-mapel-hidden">
                         </div>
                         <div class="form-group-modal">
                             <label class="form-label">Jurusan / Peminatan</label>
@@ -947,43 +922,41 @@ if ($user_id) {
                 </div>
                 <div class="modal-footer">
                     <button type="button" class="btn-action btn-secondary" onclick="closeModal('modal-edit-siswa')">Batal</button>
-                    <button type="submit" class="btn-action btn-primary">💾 Simpan Perubahan</button>
+                    <button type="submit" name="simpan" class="btn-action btn-primary">💾 Perbarui Data Siswa</button>
                 </div>
             </form>
         </div>
     </div>
 
-    <!-- ===== MODAL HAPUS SISWA ===== -->
-    <div id="modal-delete-siswa" class="modal-overlay">
+    <!-- ===== MODAL POPUP KONFIRMASI HAPUS SISWA ===== -->
+    <div id="modal-delete" class="modal-overlay">
         <div class="modal-card modal-card-sm">
             <div class="modal-header">
-                <h3>🗑️ Hapus Data Siswa</h3>
-                <button type="button" class="modal-close-btn" onclick="closeModal('modal-delete-siswa')">✕</button>
+                <h3>🗑️ Konfirmasi Hapus Siswa</h3>
+                <button type="button" class="modal-close-btn" onclick="closeModal('modal-delete')">✕</button>
             </div>
             <form action="siswa.php" method="POST">
                 <?php echo csrf_field(); ?>
                 <input type="hidden" name="action" value="delete_siswa">
-                <input type="hidden" name="nis" id="del-siswa-nis">
+                <input type="hidden" name="nis" id="del-nis">
+
                 <div class="modal-body" style="text-align: center;">
                     <div style="font-size: 40px; margin-bottom: 10px;">⚠️</div>
                     <p style="font-size: 14px; color: var(--text-title); font-weight: 700; margin-bottom: 6px;">
-                        Anda yakin ingin menghapus seluruh data siswa ini?
+                        Apakah Anda yakin ingin menghapus seluruh data siswa ini?
                     </p>
                     <p style="font-size: 13px; color: var(--text-muted);" id="del-siswa-name">-</p>
-                    <p style="font-size: 12px; color: var(--accent-rose); margin-top: 10px;">
-                        Semua nilai mata pelajaran siswa ini akan ikut terhapus.
-                    </p>
                 </div>
+
                 <div class="modal-footer" style="justify-content: center;">
-                    <button type="button" class="btn-action btn-secondary" onclick="closeModal('modal-delete-siswa')">Batal</button>
-                    <button type="submit" class="btn-action" style="background: var(--accent-rose); color: #fff;">Ya, Hapus</button>
+                    <button type="button" class="btn-action btn-secondary" onclick="closeModal('modal-delete')">Batal</button>
+                    <button type="submit" class="btn-action" style="background: var(--accent-rose); color: #fff;">Ya, Hapus Siswa</button>
                 </div>
             </form>
         </div>
     </div>
 
     <script>
-        // Modal tambah nilai
         function openAddModal() {
             document.getElementById('modal-title').innerHTML = '➕ Tambah Nilai Mata Pelajaran';
             document.getElementById('form-mode').value = 'insert';
@@ -995,27 +968,24 @@ if ($user_id) {
             document.getElementById('form-kelas').value = '';
             document.getElementById('form-mapel').value = '';
             document.getElementById('form-mapel').disabled = false;
-            document.getElementById('form-mapel').style.background = '#ffffff';
             document.getElementById('form-jurusan').value = '';
             document.getElementById('form-guru').value = '';
             document.getElementById('form-nilai').value = '';
             document.getElementById('modal-siswa').classList.add('active');
         }
 
-        // Modal edit data siswa
-        function openEditSiswaModal(data) {
-            document.getElementById('edit-nis').value = data.nis;
-            document.getElementById('edit-nama').value = data.nama_siswa;
-            document.getElementById('edit-kelas').value = data.kelas || '';
-            document.getElementById('edit-jurusan').value = data.id_jurusan || '';
+        function openEditSiswaModal(siswa) {
+            document.getElementById('edit-nis').value = siswa.nis || '';
+            document.getElementById('edit-nama').value = siswa.nama_siswa || '';
+            document.getElementById('edit-kelas').value = siswa.kelas || '';
+            document.getElementById('edit-jurusan').value = siswa.id_jurusan || '';
             document.getElementById('modal-edit-siswa').classList.add('active');
         }
 
-        // Modal hapus siswa
         function openDeleteSiswaModal(nis, nama) {
-            document.getElementById('del-siswa-nis').value = nis;
+            document.getElementById('del-nis').value = nis;
             document.getElementById('del-siswa-name').innerText = nama + ' (NIS: ' + nis + ')';
-            document.getElementById('modal-delete-siswa').classList.add('active');
+            document.getElementById('modal-delete').classList.add('active');
         }
 
         function toggleSidebar() {
@@ -1043,5 +1013,6 @@ if ($user_id) {
             }
         }
     </script>
+
 </body>
 </html>
