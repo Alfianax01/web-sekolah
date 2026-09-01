@@ -1,0 +1,29 @@
+﻿# Uploads folder — file user (foto profil, PDF bahan ajar)
+uploads/bahan_ajar/*.pdf
+uploads/*.png
+uploads/*.jpg
+uploads/*.jpeg
+uploads/*.gif
+
+# Koneksi database (jangan expose credentials)
+# koneksi.php dikecualikan untuk keamanan (uncomment baris bawah jika perlu)
+# koneksi.php
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# PHP error log
+php_errorlog
+*.log
+
+# Temp files
+*.tmp
+*.bak

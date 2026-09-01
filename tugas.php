@@ -1,776 +1,949 @@
 <?php
 session_start();
-require_once __DIR__ . '/security.php';
+require_once 'koneksi.php';
+require_login();
 
-if (!isset($_SESSION['user_id'])) {
-    header("Location: login.php");
-    exit();
-}
-
-$nav_role   = $_SESSION['role'] ?? 'siswa';
-$session_nis = $_SESSION['nis'] ?? null;
+$nav_role     = $_SESSION['role'] ?? 'siswa';
+$session_nis  = $_SESSION['nis'] ?? null;
 $session_nama = $_SESSION['nama_lengkap'] ?? ($_SESSION['username'] ?? '');
 
-// 1. KONEKSI DATABASE (sekolah2)
-$host = 'localhost';
-$db   = 'crud';
-$user = 'root';
-$pass = '';
+$msg_success = "";
+$msg_error   = "";
 
-try {
-    $pdo = new PDO("mysql:host=$host;dbname=$db;charset=utf8mb4", $user, $pass, [
-        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC
-    ]);
-} catch (PDOException $e) {
-    die("Koneksi database gagal: " . $e->getMessage());
-}
-
-$buat_status   = "";
-$kumpul_status = "";
-$nilai_status  = "";
-
-// 2. PROSES BUAT TUGAS (HANYA ADMIN)
+// ==========================================
+// 1. PROSES BUAT TUGAS (ADMIN & GURU)
+// ==========================================
 if (isset($_POST['buat_tugas'])) {
     verify_csrf();
-    if ($nav_role !== 'admin') {
-        $buat_status = "<div class='status-msg status-err'>Kamu tidak punya akses untuk membuat tugas.</div>";
+    if ($nav_role !== 'admin' && $nav_role !== 'guru') {
+        $msg_error = "Anda tidak memiliki izin untuk membuat tugas.";
     } else {
-        $judul    = trim($_POST['judul']);
-        $id_mapel = $_POST['id_mapel'] ?: null;
-        $deadline = $_POST['deadline'] ?: null;
-        $desc     = trim($_POST['deskripsi']);
+        $judul    = sanitize_input($_POST['judul'] ?? '');
+        $id_mapel = sanitize_input($_POST['id_mapel'] ?? '');
+        $deadline = sanitize_input($_POST['deadline'] ?? '');
+        $desc     = sanitize_input($_POST['deskripsi'] ?? '');
 
-        if (empty($judul)) {
-            $buat_status = "<div class='status-msg status-err'>Judul tugas wajib diisi.</div>";
-        } elseif (empty($id_mapel)) {
-            $buat_status = "<div class='status-msg status-err'>Mata pelajaran wajib dipilih.</div>";
+        if (empty($judul) || empty($id_mapel)) {
+            $msg_error = "Judul tugas dan Mata Pelajaran wajib diisi.";
         } else {
-            $stmt = $pdo->prepare("INSERT INTO tugas (judul, id_mapel, deadline, deskripsi) VALUES (:judul, :id_mapel, :deadline, :deskripsi)");
-            $result = $stmt->execute([
-                ':judul'     => $judul,
-                ':id_mapel'  => $id_mapel,
-                ':deadline'  => $deadline,
-                ':deskripsi' => $desc
-            ]);
-
-            $buat_status = $result
-                ? "<div class='status-msg status-ok'>Tugas berhasil dibuat.</div>"
-                : "<div class='status-msg status-err'>Gagal membuat tugas.</div>";
+            try {
+                $stmt = $pdo->prepare("INSERT INTO tugas (judul, id_mapel, deadline, deskripsi) VALUES (:judul, :id_mapel, :deadline, :deskripsi)");
+                $stmt->execute([
+                    ':judul'     => $judul,
+                    ':id_mapel'  => $id_mapel,
+                    ':deadline'  => (!empty($deadline) ? $deadline : null),
+                    ':deskripsi' => $desc
+                ]);
+                header("Location: tugas.php?status=tugas_dibuat");
+                exit();
+            } catch (PDOException $e) {
+                $msg_error = "Gagal membuat tugas: " . $e->getMessage();
+            }
         }
     }
 }
 
-// 3. PROSES KUMPULKAN TUGAS (PDF UPLOAD)
+// ==========================================
+// 2. PROSES KUMPULKAN TUGAS (PDF UPLOAD) - HANYA SISWA
+// ==========================================
 if (isset($_POST['kumpul_tugas'])) {
     verify_csrf();
-    $id_tugas   = $_POST['id_tugas'];
-    $nis        = ($nav_role === 'siswa') ? $session_nis : trim($_POST['nis']);
-    $nama_siswa = ($nav_role === 'siswa') ? $session_nama : trim($_POST['nama_siswa']);
-    $file       = $_FILES['file_pdf'];
-
-    if (empty($id_tugas) || empty($nama_siswa) || empty($file['name'])) {
-        $kumpul_status = "<div class='status-msg status-err'>Semua field dan file PDF wajib diisi.</div>";
+    if ($nav_role !== 'siswa') {
+        $msg_error = "Hanya siswa yang dapat mengumpulkan tugas.";
     } else {
-        $finfo = new finfo(FILEINFO_MIME_TYPE);
-        $mime = $finfo->file($file['tmp_name']);
+        $id_tugas   = sanitize_input($_POST['id_tugas'] ?? '');
+        $nis        = $session_nis;
+        $nama_siswa = $session_nama;
+        $file       = $_FILES['file_pdf'] ?? null;
 
-        if ($mime !== 'application/pdf') {
-            $kumpul_status = "<div class='status-msg status-err'>File harus berformat PDF.</div>";
-        } elseif ($file['size'] > 4 * 1024 * 1024) {
-            $kumpul_status = "<div class='status-msg status-err'>Ukuran file maksimal 4 MB.</div>";
+        if (empty($id_tugas) || empty($file['name'])) {
+            $msg_error = "Pilih tugas dan lampirkan file PDF.";
         } else {
-            $stmt_t = $pdo->prepare("SELECT deadline FROM tugas WHERE id_tugas = :id");
-            $stmt_t->execute([':id' => $id_tugas]);
-            $tugas_data = $stmt_t->fetch();
+            $finfo = new finfo(FILEINFO_MIME_TYPE);
+            $mime  = $finfo->file($file['tmp_name']);
 
-            $submitted_at = date('Y-m-d H:i:s');
-            $status = 'Tepat Waktu';
-
-            if (!empty($tugas_data['deadline'])) {
-                $deadline_time = strtotime($tugas_data['deadline'] . ' 23:59:59');
-                if (time() > $deadline_time) {
-                    $status = 'Terlambat';
-                }
-            }
-
-            $target_dir = "uploads/";
-            if (!is_dir($target_dir)) {
-                mkdir($target_dir, 0777, true);
-            }
-
-            $unique_name = time() . '_' . preg_replace('/[^a-zA-Z0-9_\.-]/', '_', $file['name']);
-            $target_file = $target_dir . $unique_name;
-
-            if (move_uploaded_file($file['tmp_name'], $target_file)) {
-                $stmt = $pdo->prepare("INSERT INTO pengumpulan_tugas (id_tugas, nis, nama_siswa, nama_file, path_file, ukuran_file, status, submitted_at) VALUES (:id_tugas, :nis, :nama_siswa, :nama_file, :path_file, :ukuran_file, :status, :submitted_at)");
-                $stmt->execute([
-                    ':id_tugas'    => $id_tugas,
-                    ':nis'         => $nis,
-                    ':nama_siswa'  => $nama_siswa,
-                    ':nama_file'   => $file['name'],
-                    ':path_file'   => $target_file,
-                    ':ukuran_file' => $file['size'],
-                    ':status'      => $status,
-                    ':submitted_at'=> $submitted_at
-                ]);
-                $kumpul_status = "<div class='status-msg status-ok'>Tugas berhasil dikumpulkan.</div>";
+            if ($mime !== 'application/pdf') {
+                $msg_error = "Berkas harus berformat PDF.";
+            } elseif ($file['size'] > 5 * 1024 * 1024) {
+                $msg_error = "Ukuran berkas maksimal 5 MB.";
             } else {
-                $kumpul_status = "<div class='status-msg status-err'>Gagal mengunggah file ke server.</div>";
+                $stmt_t = $pdo->prepare("SELECT deadline FROM tugas WHERE id_tugas = :id");
+                $stmt_t->execute([':id' => $id_tugas]);
+                $tugas_data = $stmt_t->fetch(PDO::FETCH_ASSOC);
+
+                $submitted_at = date('Y-m-d H:i:s');
+                $status = 'Tepat Waktu';
+
+                if (!empty($tugas_data['deadline'])) {
+                    $deadline_time = strtotime($tugas_data['deadline'] . ' 23:59:59');
+                    if (time() > $deadline_time) {
+                        $status = 'Terlambat';
+                    }
+                }
+
+                $target_dir = __DIR__ . "/uploads/";
+                if (!is_dir($target_dir)) {
+                    mkdir($target_dir, 0755, true);
+                }
+
+                $unique_name = 'tugas_' . time() . '_' . bin2hex(random_bytes(8)) . '.pdf';
+                $target_file = $target_dir . $unique_name;
+                $db_path     = 'uploads/' . $unique_name;
+
+                if (move_uploaded_file($file['tmp_name'], $target_file)) {
+                    try {
+                        $stmt = $pdo->prepare("INSERT INTO pengumpulan_tugas (id_tugas, nis, nama_siswa, nama_file, path_file, ukuran_file, status, submitted_at) 
+                                                VALUES (:id_tugas, :nis, :nama_siswa, :nama_file, :path_file, :ukuran_file, :status, :submitted_at)");
+                        $stmt->execute([
+                            ':id_tugas'     => $id_tugas,
+                            ':nis'          => $nis,
+                            ':nama_siswa'   => $nama_siswa,
+                            ':nama_file'    => sanitize_input($file['name']),
+                            ':path_file'    => $db_path,
+                            ':ukuran_file'  => $file['size'],
+                            ':status'       => $status,
+                            ':submitted_at' => $submitted_at
+                        ]);
+                        header("Location: tugas.php?status=tugas_dikumpul");
+                        exit();
+                    } catch (PDOException $e) {
+                        $msg_error = "Gagal menyimpan data tugas: " . $e->getMessage();
+                    }
+                } else {
+                    $msg_error = "Gagal mengunggah berkas ke server.";
+                }
             }
         }
     }
 }
 
-// 4. PROSES SIMPAN NILAI (HANYA ADMIN & GURU)
+// ==========================================
+// 3. PROSES SIMPAN NILAI (ADMIN & GURU)
+// ==========================================
 if (isset($_POST['update_nilai'])) {
     verify_csrf();
     if ($nav_role === 'admin' || $nav_role === 'guru') {
-        $id_pengumpulan = $_POST['id_pengumpulan'];
-        $nilai = trim($_POST['nilai']);
+        $id_pengumpulan = sanitize_input($_POST['id_pengumpulan'] ?? '');
+        $nilai = isset($_POST['nilai']) && $_POST['nilai'] !== '' ? max(0, min(100, (int)$_POST['nilai'])) : null;
 
-        $stmt = $pdo->prepare("UPDATE pengumpulan_tugas SET nilai = :nilai WHERE id_pengumpulan = :id");
-        $stmt->execute([':nilai' => $nilai, ':id' => $id_pengumpulan]);
-        $nilai_status = "<div class='status-msg status-ok'>Nilai berhasil disimpan.</div>";
+        try {
+            $stmt = $pdo->prepare("UPDATE pengumpulan_tugas SET nilai = :nilai WHERE id_pengumpulan = :id");
+            $stmt->execute([':nilai' => $nilai, ':id' => $id_pengumpulan]);
+            header("Location: tugas.php?status=nilai_disimpan");
+            exit();
+        } catch (PDOException $e) {
+            $msg_error = "Gagal menyimpan nilai: " . $e->getMessage();
+        }
     }
 }
 
-// 5. PROSES HAPUS PENGUMPULAN (HANYA ADMIN & GURU)
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'delete' && !empty($_POST['id'])) {
+// ==========================================
+// 4. PROSES HAPUS PENGUMPULAN TUGAS (HANYA ADMIN)
+// ==========================================
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'delete_submission') {
     verify_csrf();
-    if ($nav_role === 'admin' || $nav_role === 'guru') {
-        $del_id = $_POST['id'];
+    if ($nav_role === 'admin') {
+        $del_id = $_POST['id'] ?? '';
         $stmt = $pdo->prepare("SELECT path_file FROM pengumpulan_tugas WHERE id_pengumpulan = :id");
         $stmt->execute([':id' => $del_id]);
-        $data = $stmt->fetch();
+        $data = $stmt->fetch(PDO::FETCH_ASSOC);
 
         if ($data) {
             $file_path = realpath(__DIR__ . '/' . $data['path_file']);
             $upload_root = realpath(__DIR__ . '/uploads');
             if ($file_path && $upload_root && str_starts_with($file_path, $upload_root . DIRECTORY_SEPARATOR) && is_file($file_path)) {
-                unlink($file_path);
+                @unlink($file_path);
             }
             $stmt_del = $pdo->prepare("DELETE FROM pengumpulan_tugas WHERE id_pengumpulan = :id");
             $stmt_del->execute([':id' => $del_id]);
         }
+        header("Location: tugas.php?status=pengumpulan_dihapus");
+        exit();
     }
-    header("Location: tugas.php");
-    exit();
 }
 
-// 6. AMBIL DATA DARI DATABASE
-$mapel_list = $pdo->query("SELECT * FROM mapel ORDER BY nama_mapel ASC")->fetchAll();
+// Status messages
+if (isset($_GET['status'])) {
+    if ($_GET['status'] === 'tugas_dibuat') $msg_success = "Tugas baru berhasil diterbitkan!";
+    if ($_GET['status'] === 'tugas_dikumpul') $msg_success = "Tugas berhasil dikumpulkan!";
+    if ($_GET['status'] === 'nilai_disimpan') $msg_success = "Nilai tugas berhasil disimpan!";
+    if ($_GET['status'] === 'pengumpulan_dihapus') $msg_success = "Data pengumpulan tugas berhasil dihapus!";
+}
+
+// ==========================================
+// 5. DATA QUERY
+// ==========================================
+$mapel_list = $pdo->query("SELECT * FROM mapel ORDER BY nama_mapel ASC")->fetchAll(PDO::FETCH_ASSOC);
 
 $tugas_list = $pdo->query("
     SELECT t.*, m.nama_mapel 
     FROM tugas t 
     LEFT JOIN mapel m ON t.id_mapel = m.id_mapel 
     ORDER BY t.id_tugas DESC
-")->fetchAll();
+")->fetchAll(PDO::FETCH_ASSOC);
 
+// Submissions query
 $submissions_sql = "
     SELECT p.*, t.judul AS tugas_judul, t.id_mapel, m.nama_mapel
     FROM pengumpulan_tugas p 
     LEFT JOIN tugas t ON p.id_tugas = t.id_tugas 
     LEFT JOIN mapel m ON t.id_mapel = m.id_mapel
+    WHERE 1=1
 ";
 
+$params_sub = [];
 if ($nav_role === 'siswa') {
-    $submissions_sql .= " WHERE p.nis = :nis ORDER BY p.id_pengumpulan DESC";
-    $stmt_sub = $pdo->prepare($submissions_sql);
-    $stmt_sub->execute([':nis' => $session_nis]);
-    $submissions = $stmt_sub->fetchAll();
-} else {
-    $submissions_sql .= " ORDER BY p.id_pengumpulan DESC";
-    $submissions = $pdo->query($submissions_sql)->fetchAll();
+    $submissions_sql .= " AND p.nis = :nis";
+    $params_sub[':nis'] = $session_nis;
 }
 
-if (!isset($_SESSION['user_id'])) {
-    header("Location: login.php");
-    exit();
-}
+$submissions_sql .= " ORDER BY p.id_pengumpulan DESC";
+$stmt_sub = $pdo->prepare($submissions_sql);
+$stmt_sub->execute($params_sub);
+$submissions = $stmt_sub->fetchAll(PDO::FETCH_ASSOC);
 
-$user_id = $_SESSION['user_id'];
-$nav_role = $_SESSION['role'] ?? 'siswa';
-
+// User info
+$user_id = $_SESSION['user_id'] ?? null;
 $foto_user = '';
-try {
-    $stmt = $pdo->prepare("SELECT foto FROM users WHERE id = :id LIMIT 1");
-    $stmt->execute([':id' => $user_id]);
-    $userData = $stmt->fetch(PDO::FETCH_ASSOC);
-    if ($userData && !empty($userData['foto'])) {
-        $foto_user = $userData['foto'];
-    }
-} catch (PDOException $e) {
+if ($user_id) {
+    try {
+        $stmtFoto = $pdo->prepare("SELECT foto FROM users WHERE id = :id LIMIT 1");
+        $stmtFoto->execute([':id' => $user_id]);
+        $uD = $stmtFoto->fetch(PDO::FETCH_ASSOC);
+        if ($uD && !empty($uD['foto'])) {
+            $foto_user = $uD['foto'];
+        }
+    } catch (Exception $e) {}
 }
-
 ?>
-
 <!DOCTYPE html>
 <html lang="id">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Kelola Tugas - Pemantauan Sekolah</title>
+    <title>Kelola Tugas & Penilaian - Portal Akademik</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <style>
         :root {
             --primary: #1e293b;
             --primary-light: #334155;
             --accent: #2563eb;
+            --accent-hover: #1d4ed8;
+            --accent-green: #10b981;
+            --accent-amber: #f59e0b;
+            --accent-rose: #ef4444;
             --bg-main: #f8fafc;
             --bg-card: #ffffff;
+            --bg-subtle: #f1f5f9;
             --text-main: #334155;
+            --text-title: #1e293b;
             --text-muted: #64748b;
             --border: #e2e8f0;
-            --warning: #f59e0b;
-            --danger: #ef4444;
-            --success: #10b981;
+            --radius-lg: 14px;
+            --radius-md: 10px;
+            --radius-sm: 6px;
+            --shadow-sm: 0 1px 3px rgba(0,0,0,0.02);
+            --shadow-card: 0 2px 10px rgba(0,0,0,0.03);
+            --shadow-modal: 0 20px 40px -10px rgba(15, 23, 42, 0.25);
         }
 
-        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
-        body { background-color: var(--bg-main); color: var(--text-main); line-height: 1.6; overflow-x: hidden; }
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Plus Jakarta Sans', 'Segoe UI', sans-serif; }
+        body { background-color: var(--bg-main); color: var(--text-main); line-height: 1.6; }
 
-        /* HEADER UTAMA */
-        .header-main {
-            display: flex;
-            align-items: stretch;
-            background: #ffffff;
-            border-bottom: 1px solid var(--border);
-            box-shadow: 0 2px 10px rgba(0,0,0,0.02);
-            position: sticky;
-            top: 0;
-            z-index: 100;
-            width: 100%;
-        }
-
+        .header-main { display: flex; align-items: stretch; background: #ffffff; border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 100; }
         .header-accent-line { width: 6px; background-color: var(--accent); flex-shrink: 0; }
-
-        .header-content {
-            flex: 1;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 12px 40px;
-            max-width: 1400px;
-            margin: 0 auto;
-        }
-
-        .header-left h1 { color: var(--primary); font-size: 18px; font-weight: 800; letter-spacing: 0.5px; text-transform: uppercase; line-height: 1.2; }
-        .header-left p { color: var(--text-muted); font-size: 11px; font-weight: 600; letter-spacing: 0.5px; margin-bottom: 2px; text-transform: uppercase; }
-
+        .header-content { flex: 1; display: flex; justify-content: space-between; align-items: center; padding: 14px 40px; max-width: 1440px; margin: 0 auto; gap: 20px; }
+        .header-left h1 { color: var(--primary); font-size: 18px; font-weight: 800; text-transform: uppercase; line-height: 1.2; }
+        .header-left p { color: var(--text-muted); font-size: 11px; font-weight: 700; text-transform: uppercase; }
         .header-right { display: flex; align-items: center; gap: 12px; }
+        .user-badge { display: flex; align-items: center; gap: 10px; background: var(--bg-main); padding: 5px 14px 5px 5px; border-radius: 30px; border: 1px solid var(--border); }
+        .user-avatar { background: var(--accent); color: white; width: 34px; height: 34px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 14px; font-weight: bold; overflow: hidden; }
+        .user-avatar img { width: 100%; height: 100%; object-fit: cover; }
+        .user-info { display: flex; flex-direction: column; line-height: 1.2; }
+        .user-role { color: var(--primary); font-size: 12px; font-weight: 700; text-transform: uppercase; }
+        .user-status { color: var(--accent-green); font-size: 10px; font-weight: 600; }
 
-        .user-badge {
-            display: flex; align-items: center; gap: 8px;
-            background: var(--bg-main); padding: 5px 12px 5px 5px;
-            border-radius: 30px; border: 1px solid var(--border);
-        }
-        .user-avatar {
-            background: var(--accent); 
-            color: white; 
-            width: 32px;
-            height: 32px;
-            border-radius: 50%; 
-            display: flex; 
-            align-items: center; 
-            justify-content: center; 
-            font-size: 14px; 
-            font-weight: bold;
-            overflow: hidden;
-            flex-shrink: 0;
-            border: 2px solid #fff;
-        }
-        .user-avatar img {
-            width: 100%;
-            height: 100%;
-            object-fit: cover;
-        }
-        .user-info { display: flex; flex-direction: column; }
-        .user-role { color: var(--primary); font-size: 11px; font-weight: 700; text-transform: uppercase; line-height: 1; margin-bottom: 2px; }
-        .user-status { color: var(--success); font-size: 9px; font-weight: 600; }
-
-        .header-date { color: var(--text-main); font-size: 12px; font-weight: 600; background: var(--bg-main); padding: 6px 12px; border-radius: 6px; border: 1px solid var(--border); }
-
-        /* NAVBAR MENU */
         .navbar-menu { background-color: var(--primary); width: 100%; box-shadow: inset 0 -3px 0 rgba(0,0,0,0.1); }
-        .navbar-inner { max-width: 1400px; margin: 0 auto; padding: 0 40px; }
+        .navbar-inner { max-width: 1440px; margin: 0 auto; padding: 0 40px; }
         .navbar-menu ul { list-style: none; display: flex; align-items: center; gap: 2px; overflow-x: auto; }
-        .navbar-menu a.nav-link {
-            display: inline-block; color: rgba(255, 255, 255, 0.75); text-decoration: none; font-weight: 600; font-size: 12px;
-            text-transform: uppercase; padding: 12px 16px; transition: all 0.2s ease; border-bottom: 3px solid transparent; letter-spacing: 0.5px;
-            white-space: nowrap;
-        }
+        .navbar-menu a.nav-link { display: inline-flex; align-items: center; gap: 6px; color: rgba(255, 255, 255, 0.75); text-decoration: none; font-weight: 600; font-size: 12.5px; text-transform: uppercase; padding: 13px 16px; border-bottom: 3px solid transparent; white-space: nowrap; }
         .navbar-menu a.nav-link:hover { color: white; background-color: rgba(255, 255, 255, 0.05); }
-        .navbar-menu a.nav-link.active { color: white; border-bottom-color: var(--accent); }
+        .navbar-menu a.nav-link.active { color: white; border-bottom-color: var(--accent); background-color: rgba(255, 255, 255, 0.05); }
         .navbar-menu a.nav-link.nav-logout { color: #fca5a5; margin-left: auto; }
-        .navbar-menu a.nav-link.nav-logout:hover { color: #ef4444; background-color: rgba(239, 68, 68, 0.1); }
 
-        /* KONTEN UTAMA */
-        .main-container { max-width: 1400px; margin: 25px auto 40px; padding: 0 40px; width: 100%; }
-        .content-box { background: var(--bg-card); padding: 25px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.02); margin-bottom: 25px; border: 1px solid var(--border); width: 100%; }
-        
-        .section-title { 
-            font-size: 16px; color: var(--primary); font-weight: 800; border-bottom: 2px solid var(--bg-main); 
-            padding-bottom: 10px; margin-bottom: 15px; display: flex; align-items: center; justify-content: space-between; 
-        }
-        .section-sub { color: var(--text-muted); font-size: 13px; margin-bottom: 20px; font-weight: 600; }
+        .main-container { max-width: 1440px; margin: 26px auto 50px; padding: 0 40px; }
+        .page-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; flex-wrap: wrap; gap: 12px; }
+        .page-header h2 { font-size: 20px; font-weight: 800; color: var(--text-title); }
+        .page-header p { font-size: 13px; color: var(--text-muted); }
+        .header-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 
-        /* FORM & INPUT */
-        .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; margin-bottom: 16px; }
-        .form-grid.full { grid-template-columns: 1fr; }
-        .form-group { display: flex; flex-direction: column; }
-        .form-group label, label { font-size: 12px; font-weight: 700; color: var(--primary); margin-bottom: 6px; text-transform: uppercase; }
-        input[type=text], input[type=date], input[type=number], textarea, select {
-            height: 42px; border: 1px solid var(--border); border-radius: 6px; padding: 0 14px; font-size: 13px; background: var(--bg-main); color: var(--text-main); transition: all 0.2s; width: 100%;
-        }
-        input:focus, textarea:focus, select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(37,99,235,0.1); background: white; }
-        input[readonly] { background: #e2e8f0; color: var(--text-muted); cursor: not-allowed; }
-        textarea { height: auto; resize: vertical; min-height: 80px; padding: 12px 14px; }
+        .content-box { background: var(--bg-card); padding: 22px; border-radius: var(--radius-lg); box-shadow: var(--shadow-card); border: 1px solid var(--border); margin-bottom: 22px; }
+        .section-title { font-size: 14.5px; color: var(--text-title); font-weight: 800; border-bottom: 2px solid var(--bg-subtle); padding-bottom: 12px; margin-bottom: 16px; }
 
-        /* DROPZONE FILE */
-        .dropzone {
-            border: 2px dashed var(--border); border-radius: 8px; padding: 24px; text-align: center;
-            color: var(--text-muted); font-size: 13px; cursor: pointer; background: var(--bg-main); transition: all 0.2s;
-        }
-        .dropzone:hover { border-color: var(--accent); background: white; }
-        .dropzone strong { color: var(--primary); }
+        .alert-box { padding: 12px 16px; border-radius: var(--radius-md); font-size: 13.5px; font-weight: 600; margin-bottom: 18px; display: flex; align-items: center; gap: 8px; }
+        .alert-box.success { background: #f0fdf4; color: #166534; border: 1px solid #bbf7d0; }
+        .alert-box.error { background: #fef2f2; color: #991b1b; border: 1px solid #fecaca; }
 
-        /* BUTTONS */
-        .btn { border: none; cursor: pointer; text-decoration: none; display: inline-block; padding: 8px 16px; border-radius: 6px; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; transition: all 0.2s; }
-        .btn-primary { background: var(--accent); color: white; }
-        .btn-primary:hover { background: #1d4ed8; }
-        .btn-blue { background: var(--accent); color: white; padding: 6px 12px; font-size: 11px; }
-        .btn-blue:hover { background: #1d4ed8; }
-        .btn-green { background: var(--success); color: white; padding: 6px 12px; font-size: 11px; }
-        .btn-green:hover { background: #059669; }
-        .btn-red { background: var(--danger); color: white; padding: 6px 12px; font-size: 11px; }
-        .btn-red:hover { background: #dc2626; }
+        .btn-action { display: inline-flex; align-items: center; gap: 6px; padding: 9px 18px; border-radius: var(--radius-sm); font-size: 13px; font-weight: 700; border: none; cursor: pointer; text-decoration: none; transition: all 0.2s; }
+        .btn-primary { background: var(--accent); color: #fff; }
+        .btn-primary:hover { background: var(--accent-hover); }
+        .btn-secondary { background: var(--bg-subtle); color: var(--text-main); border: 1px solid var(--border); }
 
-        /* TABLE */
-        .table-responsive { overflow-x: auto; width: 100%; }
-        table { width: 100%; border-collapse: collapse; min-width: 700px; }
-        th { background: var(--bg-main); color: var(--primary); font-size: 12px; font-weight: 800; text-align: left; padding: 12px 14px; border-bottom: 2px solid var(--border); text-transform: uppercase; letter-spacing: 0.5px; }
-        td { padding: 12px 14px; font-size: 13px; border-bottom: 1px solid var(--border); color: var(--text-main); vertical-align: middle; }
-        tbody tr:hover { background-color: var(--bg-main); }
-        td strong { color: var(--primary); font-weight: 700; }
+        .table-responsive { width: 100%; overflow-x: auto; }
+        .table-custom { width: 100%; border-collapse: collapse; text-align: left; }
+        .table-custom th { background: var(--bg-subtle); padding: 12px 14px; font-size: 12px; font-weight: 700; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid var(--border); }
+        .table-custom td { padding: 12px 14px; font-size: 13px; color: var(--text-main); border-bottom: 1px solid var(--border); vertical-align: middle; }
+        .table-custom tr:hover { background-color: #fcfdfe; }
 
-        /* BADGES */
-        .badge { display: inline-block; padding: 4px 10px; border-radius: 12px; font-size: 11px; font-weight: 700; text-transform: uppercase; }
-        .badge-ontime { background: #ecfdf5; color: #059669; }
-        .badge-late { background: #fef2f2; color: #dc2626; }
-        .badge-mapel { background: #eff6ff; color: var(--accent); }
-        .badge-nilai { background: #fffbeb; color: #d97706; padding: 4px 10px; border-radius: 6px; font-weight: 700; font-size: 12px; border: 1px solid #fde68a; }
-        
-        .empty { text-align: center; padding: 30px; color: var(--text-muted); font-size: 13px; font-weight: 600; }
-        .meta-line { color: var(--text-muted); font-size: 11.5px; font-weight: 600; }
-        .fname { display: flex; align-items: center; gap: 6px; margin-top: 3px; }
-        
-        .nilai-form { display: flex; gap: 6px; align-items: center; }
-        .nilai-form input { width: 70px; height: 32px; padding: 0 8px; font-size: 12px; text-align: center; }
-        .nilai-form button { height: 32px; padding: 0 10px; font-size: 11px; }
+        .badge-pill { display: inline-block; padding: 3px 9px; border-radius: 20px; font-size: 11.5px; font-weight: 700; }
+        .badge-ontime { background: #ecfdf5; color: #047857; border: 1px solid #a7f3d0; }
+        .badge-late { background: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; }
+        .badge-blue { background: #eff6ff; color: #1d4ed8; border: 1px solid #bfdbfe; }
 
-        /* MODAL PREVIEW */
-        .modal {
+        .btn-tbl { padding: 5px 10px; border-radius: var(--radius-sm); font-size: 11.5px; font-weight: 700; text-decoration: none; display: inline-flex; align-items: center; gap: 4px; border: 1px solid transparent; cursor: pointer; }
+        .btn-tbl-view { background: #eff6ff; color: #1d4ed8; border-color: #bfdbfe; }
+        .btn-tbl-delete { background: #fef2f2; color: #b91c1c; border-color: #fecaca; }
+
+        .form-control { width: 100%; height: 38px; padding: 0 12px; font-size: 13px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: #ffffff; color: var(--text-title); outline: none; transition: all 0.2s; }
+        .form-control:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1); }
+        textarea.form-control { height: 80px; padding: 10px 12px; resize: vertical; }
+
+        /* ===== MODAL POPUP SYSTEM ===== */
+        .modal-overlay { position: fixed; inset: 0; background: rgba(15, 23, 42, 0.6); backdrop-filter: blur(4px); display: none; align-items: center; justify-content: center; z-index: 1000; padding: 20px; animation: fadeIn 0.2s ease; }
+        .modal-overlay.active { display: flex; }
+        .modal-card { background: #ffffff; width: 100%; max-width: 580px; border-radius: var(--radius-lg); box-shadow: var(--shadow-modal); border: 1px solid var(--border); overflow: hidden; animation: slideUp 0.25s ease; }
+        .modal-card-sm { max-width: 420px; }
+        .modal-card-lg { max-width: 900px; }
+        .modal-header { padding: 16px 24px; background: #ffffff; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
+        .modal-header h3 { font-size: 16px; font-weight: 800; color: var(--text-title); display: flex; align-items: center; gap: 8px; }
+        .modal-close-btn { background: none; border: none; font-size: 20px; color: var(--text-muted); cursor: pointer; padding: 4px; line-height: 1; border-radius: 4px; }
+        .modal-close-btn:hover { color: var(--text-title); background: var(--bg-subtle); }
+        .modal-body { padding: 22px 24px; }
+        .modal-footer { padding: 14px 24px; background: var(--bg-subtle); border-top: 1px solid var(--border); display: flex; align-items: center; justify-content: flex-end; gap: 10px; }
+
+        .form-grid-modal { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
+        .form-group-modal { margin-bottom: 12px; }
+        .form-group-modal.full { grid-column: span 2; }
+        .form-label { display: block; font-size: 12.5px; font-weight: 700; color: var(--text-title); margin-bottom: 5px; }
+
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+        @keyframes slideUp { from { transform: translateY(16px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+
+        /* ===== RESPONSIVE & SIDEBAR DRAWER ===== */
+        .btn-hamburger {
             display: none;
-            position: fixed;
-            z-index: 1000;
-            left: 0;
-            top: 0;
-            width: 100%;
-            height: 100%;
-            overflow: auto;
-            background-color: rgba(15, 23, 42, 0.6);
-            align-items: center;
-            justify-content: center;
-            backdrop-filter: blur(2px);
-        }
-
-        .modal-content {
-            background-color: var(--bg-card);
-            margin: auto;
-            border: none;
-            width: 90%;
-            max-width: 850px;
-            height: 85vh;
-            border-radius: 12px;
-            display: flex;
             flex-direction: column;
-            overflow: hidden;
-            box-shadow: 0 20px 50px rgba(0,0,0,0.3);
-        }
-
-        .modal-header {
-            display: flex;
             justify-content: space-between;
-            align-items: center;
-            padding: 16px 22px;
-            background: var(--primary);
-            flex-shrink: 0;
-        }
-
-        .modal-header h3 {
-            font-size: 15px;
-            font-weight: 700;
-            color: #ffffff;
-            letter-spacing: 0.3px;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-
-        .close-btn {
-            color: rgba(255,255,255,0.6);
-            font-size: 24px;
-            font-weight: 400;
-            line-height: 1;
-            cursor: pointer;
+            width: 28px;
+            height: 20px;
             background: transparent;
             border: none;
-            padding: 4px 8px;
-            border-radius: 6px;
-            transition: all 0.15s;
+            cursor: pointer;
+            padding: 0;
+            flex-shrink: 0;
         }
-
-        .close-btn:hover {
-            color: #ffffff;
-            background: rgba(255,255,255,0.1);
-        }
-
-        .modal-body {
-            flex: 1;
-            width: 100%;
-            background: #525659;
-            overflow: hidden;
-        }
-
-        .modal-body iframe {
-            width: 100%;
-            height: 100%;
-            border: none;
+        .btn-hamburger span {
             display: block;
+            width: 100%;
+            height: 3px;
+            background-color: var(--primary);
+            border-radius: 3px;
+            transition: all 0.25s ease;
+        }
+        .nav-backdrop {
+            position: fixed;
+            inset: 0;
+            background: rgba(15, 23, 42, 0.6);
+            backdrop-filter: blur(4px);
+            z-index: 1050;
+            display: none;
+            opacity: 0;
+            transition: opacity 0.25s ease;
+        }
+        .nav-backdrop.active {
+            display: block;
+            opacity: 1;
+        }
+        .sidebar-drawer-header {
+            display: none;
         }
 
-        /* RESPONSIVE */
-        @media (max-width: 992px) { 
-            .main-container, .header-content, .navbar-inner { padding-left: 20px; padding-right: 20px; }
+        @media (max-width: 992px) {
+            .header-content { padding: 12px 20px; }
+            .main-container { padding: 0 20px; }
+            .navbar-inner { padding: 0 20px; }
         }
-        @media (max-width: 768px) { 
-            .header-content { flex-direction: column; gap: 12px; align-items: flex-start; padding: 12px 20px; }
-            .navbar-menu a.nav-link.nav-logout { margin-left: 0; }
+
+        @media (max-width: 768px) {
+            .btn-hamburger { display: flex; }
+            .header-content {
+                flex-direction: column;
+                align-items: stretch;
+                gap: 12px;
+                padding: 12px 16px;
+            }
+            .header-right {
+                justify-content: space-between;
+                flex-wrap: wrap;
+                width: 100%;
+            }
+            .user-badge { padding: 4px 10px 4px 4px; }
+            .header-date { font-size: 11px; padding: 4px 10px; }
+            .main-container { padding: 0 14px; margin: 16px auto 36px; }
+
+            /* SIDEBAR DRAWER */
+            .navbar-menu {
+                position: fixed;
+                top: 0;
+                left: 0;
+                bottom: 0;
+                width: 280px;
+                max-width: 82vw;
+                height: 100vh;
+                z-index: 1100;
+                transform: translateX(-100%);
+                transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+                box-shadow: 4px 0 24px rgba(15, 23, 42, 0.25);
+                overflow-y: auto;
+                display: flex;
+                flex-direction: column;
+            }
+            .navbar-menu.active {
+                transform: translateX(0);
+            }
+            .navbar-inner {
+                padding: 0;
+                width: 100%;
+                flex: 1;
+                display: flex;
+                flex-direction: column;
+            }
+            .sidebar-drawer-header {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                padding: 16px 20px;
+                border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+                background: rgba(0, 0, 0, 0.15);
+            }
+            .sidebar-brand {
+                color: #ffffff;
+                font-weight: 800;
+                font-size: 13.5px;
+                text-transform: uppercase;
+                letter-spacing: 0.5px;
+                display: flex;
+                align-items: center;
+                gap: 8px;
+            }
+            .sidebar-close-btn {
+                background: transparent;
+                border: none;
+                color: #94a3b8;
+                font-size: 22px;
+                cursor: pointer;
+                padding: 2px 6px;
+                line-height: 1;
+                border-radius: 4px;
+            }
+            .sidebar-close-btn:hover {
+                color: #ffffff;
+                background: rgba(255, 255, 255, 0.1);
+            }
+            .navbar-menu ul {
+                flex-direction: column;
+                align-items: stretch;
+                gap: 4px;
+                padding: 12px 10px;
+                flex: 1;
+            }
+            .navbar-menu a.nav-link {
+                padding: 12px 16px;
+                font-size: 13px;
+                border-bottom: none;
+                border-left: 4px solid transparent;
+                border-radius: var(--radius-sm);
+            }
+            .navbar-menu a.nav-link.active {
+                border-left-color: var(--accent);
+                background-color: rgba(255, 255, 255, 0.08);
+            }
+            .navbar-menu a.nav-link.nav-logout {
+                margin-top: auto;
+                margin-left: 0;
+                border-top: 1px solid rgba(255, 255, 255, 0.1);
+                border-radius: 0;
+                padding: 14px 16px;
+            }
+
+            .page-header {
+                flex-direction: column;
+                align-items: stretch;
+                gap: 12px;
+            }
+            .page-header h2 { font-size: 17px; }
+            .page-header p { font-size: 12px; }
+            .header-actions { width: 100%; }
+            .header-actions .btn-action { width: 100%; justify-content: center; }
+
+            .content-box { padding: 16px 14px; }
+
+            .modal-overlay { padding: 12px; }
+            .modal-card, .modal-card-sm, .modal-card-lg {
+                max-width: 100% !important;
+                max-height: 90vh;
+                display: flex;
+                flex-direction: column;
+            }
+            .modal-body {
+                overflow-y: auto;
+                -webkit-overflow-scrolling: touch;
+            }
+            .modal-footer {
+                flex-direction: column-reverse;
+                gap: 8px;
+            }
+            .modal-footer .btn-action {
+                width: 100%;
+                justify-content: center;
+            }
+            .form-grid-modal { grid-template-columns: 1fr !important; }
+            .form-group-modal.full { grid-column: span 1 !important; }
         }
     </style>
 </head>
 <body>
 
-    <!-- HEADER UTAMA -->
+    <!-- Backdrop Overlay untuk Mobile Sidebar -->
+    <div id="navBackdrop" class="nav-backdrop" onclick="closeSidebar()"></div>
+
+    <!-- ===== HEADER UTAMA ===== -->
     <header class="header-main">
         <div class="header-accent-line"></div>
         <div class="header-content">
-            <div class="header-left">
-                <p>Pemantauan Sekolah</p>
-                <h1>Kelola Tugas</h1>
-            </div>
-            <div class="header-right">
-                <div class="header-date">
-                    <?php 
-                    $hari = array("Minggu","Senin","Selasa","Rabu","Kamis","Jumat","Sabtu");
-                    $bulan = array("","Januari","Februari","Maret","April","Mei","Juni","Juli","Agustus","September","Oktober","November","Desember");
-                    echo $hari[date("w")] . ", " . date("j") . " " . $bulan[date("n")] . " " . date("Y");
-                    ?>
+            <div style="display: flex; align-items: center; gap: 14px;">
+                <button type="button" class="btn-hamburger" onclick="toggleSidebar()" aria-label="Buka Menu">
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                </button>
+                <div class="header-left">
+                    <p>SISTEM INFORMASI AKADEMIK</p>
+                    <h1>PORTAL UTAMA SEKOLAH</h1>
                 </div>
-                <div class="user-badge" style="display: flex; align-items: center; gap: 10px; background: #fff; padding: 5px 15px; border-radius: 50px; border: 1px solid var(--border);">
-    <div class="user-avatar">
-        <?php if (!empty($foto_user) && file_exists('uploads/' . $foto_user)): ?>
-            <img src="uploads/<?php echo htmlspecialchars($foto_user); ?>" alt="Foto">
-        <?php else: ?>
-            <?php echo strtoupper(substr($nav_role, 0, 1)); ?>
-        <?php endif; ?>
-    </div>
-    <div class="user-info">
-        <span class="user-role" style="font-size: 10px; font-weight: 800; color: var(--primary);"><?php echo htmlspecialchars($nav_role); ?></span>
-        <span class="user-status" style="color: #10b981; font-size: 9px; font-weight: 600;">● Online</span>
-    </div>
-</div>
+            </div>
+            
+            <div class="header-right">
+                <a href="profile.php" style="text-decoration: none;">
+                    <div class="user-badge">
+                        <div class="user-avatar">
+                            <?php if (!empty($foto_user) && file_exists('uploads/' . $foto_user)): ?>
+                                <img src="uploads/<?php echo htmlspecialchars($foto_user); ?>" alt="Foto">
+                            <?php else: ?>
+                                <?php echo strtoupper(substr($_SESSION['username'] ?? 'U', 0, 1)); ?>
+                            <?php endif; ?>
+                        </div>
+                        <div class="user-info">
+                            <span class="user-role"><?php echo htmlspecialchars($_SESSION['username'] ?? ''); ?></span>
+                            <span class="user-status">● <?php echo htmlspecialchars(ucfirst($nav_role)); ?></span>
+                        </div>
+                    </div>
+                </a>
+
+                <div class="header-date">
+                    📅 <?php echo date('d M Y'); ?>
+                </div>
+            </div>
+        </div>
     </header>
 
-    <!-- NAVBAR MENU -->
-    <nav class="navbar-menu">
+    <!-- ===== NAVBAR MENU / SIDEBAR (NAVY SLATE) ===== -->
+    <nav id="navbarMenu" class="navbar-menu">
         <div class="navbar-inner">
+            <div class="sidebar-drawer-header">
+                <div class="sidebar-brand">🎓 Portal Akademik</div>
+                <button type="button" class="sidebar-close-btn" onclick="closeSidebar()" aria-label="Tutup Menu">✕</button>
+            </div>
             <ul>
-                <li><a href="index.php" class="nav-link">Home</a></li>
+                <li><a href="index.php" class="nav-link">Beranda</a></li>
                 <?php if ($nav_role !== 'siswa'): ?>
-                <li><a href="siswa.php" class="nav-link">Data Siswa</a></li>
-                <li><a href="guru.php" class="nav-link">Data Guru</a></li>
-                <li><a href="mapel.php" class="nav-link">Data Mapel</a></li>
-                <li><a href="jurusan.php" class="nav-link">Data Jurusan</a></li>
-                <li><a href="bahan_ajar.php" class="nav-link">Bahan Ajar</a></li>
+                    <li><a href="siswa.php" class="nav-link">Data Siswa</a></li>
+                    <li><a href="guru.php" class="nav-link">Data Guru</a></li>
+                    <li><a href="mapel.php" class="nav-link">Data Mapel</a></li>
+                    <li><a href="jurusan.php" class="nav-link">Data Jurusan</a></li>
+                    <li><a href="bahan_ajar.php" class="nav-link">Bahan Ajar</a></li>
                 <?php endif; ?>
                 <li><a href="tugas.php" class="nav-link active">Tugas</a></li>
-                 <?php if ($nav_role === 'siswa'): ?>
-    <!-- Kode card / menu Pelajaran taruh di sini -->
-    <div class="menu-card">
-        <li><a href="pelajaran.php" class="nav-link" data-translate="nav_pelajaran">Pelajaran</a></li>
-        <!-- dst... -->
-    </div>
-<?php endif; ?>
+                <?php if ($nav_role === 'siswa'): ?>
+                    <li><a href="pelajaran.php" class="nav-link">Pelajaran</a></li>
+                <?php endif; ?>
                 <li><a href="profile.php" class="nav-link">Profil Saya</a></li>
                 <li><a href="logout.php" class="nav-link nav-logout">Logout</a></li>
             </ul>
         </div>
     </nav>
 
-    <div class="main-container">
+    <!-- ===== MAIN CONTAINER ===== -->
+    <main class="main-container">
 
-        <?php if ($nav_role === 'admin'): ?>
-        <!-- CARD 1: BUAT TUGAS BARU (ADMIN ONLY) -->
-        <div class="content-box">
-            <div class="section-title">Buat Tugas Baru</div>
-            <div class="section-sub">Tugas yang dibuat akan muncul di daftar dan siswa bisa mengumpulkan file PDF berdasarkan Mata Pelajaran (ID Mapel).</div>
-            
-            <form action="tugas.php" method="POST">
-                <?php echo csrf_field(); ?>
-                <div class="form-grid">
-                    <div class="form-group">
-                        <label>Judul Tugas</label>
-                        <input type="text" name="judul" required placeholder="Contoh: Laporan Praktikum Bab 3">
-                    </div>
-                    <div class="form-group">
-                        <label>Mata Pelajaran (ID Mapel)</label>
-                        <select name="id_mapel" required>
-                            <?php if (empty($mapel_list)): ?>
-                                <option value="">— Belum ada data mapel —</option>
-                            <?php else: ?>
-                                <option value="">— Pilih Mata Pelajaran —</option>
-                                <?php foreach ($mapel_list as $m): ?>
-                                    <option value="<?php echo $m['id_mapel']; ?>">
-                                        [ID: <?php echo $m['id_mapel']; ?>] <?php echo htmlspecialchars($m['nama_mapel']); ?>
-                                    </option>
-                                <?php endforeach; ?>
-                            <?php endif; ?>
-                        </select>
-                    </div>
-                </div>
-
-                <div class="form-grid">
-                    <div class="form-group">
-                        <label>Batas Waktu Pengumpulan</label>
-                        <input type="date" name="deadline">
-                    </div>
-                </div>
-
-                <div class="form-grid full">
-                    <div class="form-group">
-                        <label>Deskripsi / Instruksi</label>
-                        <textarea name="deskripsi" placeholder="Instruksi pengerjaan tugas untuk siswa..."></textarea>
-                    </div>
-                </div>
-
-                <div style="margin-top: 10px;">
-                    <button type="submit" name="buat_tugas" class="btn btn-primary">+ Buat Tugas</button>
-                </div>
-                <?php echo $buat_status; ?>
-            </form>
+        <div class="page-header">
+            <div>
+                <h2>📝 Manajemen Tugas & Pengumpulan Berkas</h2>
+                <p>Pemberian tugas akademik, pengumpulan berkas PDF siswa, serta evaluasi penilaian.</p>
+            </div>
+            <div class="header-actions">
+                <?php if ($nav_role === 'admin' || $nav_role === 'guru'): ?>
+                    <button type="button" class="btn-action btn-primary" onclick="openCreateTaskModal()">
+                        ➕ Terbitkan Tugas Baru
+                    </button>
+                <?php endif; ?>
+                <?php if ($nav_role === 'siswa'): ?>
+                    <button type="button" class="btn-action btn-primary" onclick="openSubmitTaskModal()">
+                        📤 Kumpulkan Tugas PDF
+                    </button>
+                <?php endif; ?>
+            </div>
         </div>
+
+        <?php if ($msg_success): ?>
+            <div class="alert-box success">✅ <?php echo htmlspecialchars($msg_success); ?></div>
+        <?php endif; ?>
+        <?php if ($msg_error): ?>
+            <div class="alert-box error">⚠️ <?php echo htmlspecialchars($msg_error); ?></div>
         <?php endif; ?>
 
-        <?php if ($nav_role === 'siswa'): ?>
-        <!-- CARD 2: KUMPULKAN TUGAS (SISWA ONLY) -->
+        <!-- DAFTAR TUGAS AKTIF -->
         <div class="content-box">
-            <div class="section-title">Kumpulkan Tugas (PDF)</div>
-            <div class="section-sub">Pilih tugas beserta Mata Pelajaran terkait, pastikan identitasmu benar, lalu unggah file PDF jawaban.</div>
+            <h3 class="section-title">📋 Daftar Tugas Aktif</h3>
 
-            <form action="tugas.php" method="POST" enctype="multipart/form-data">
-                <?php echo csrf_field(); ?>
-                <div class="form-grid" style="grid-template-columns: 2fr 1fr 1fr; margin-bottom: 20px;">
-                    <div class="form-group">
-                        <label>Pilih Tugas & Mapel</label>
-                        <select name="id_tugas" required>
-                            <?php if (empty($tugas_list)): ?>
-                                <option value="">— Belum ada tugas —</option>
-                            <?php else: ?>
-                                <option value="">— Pilih Tugas —</option>
-                                <?php foreach ($tugas_list as $t): ?>
-                                    <option value="<?php echo $t['id_tugas']; ?>">
-                                        <?php echo htmlspecialchars($t['judul']); ?> — Mapel: <?php echo htmlspecialchars($t['nama_mapel'] ?: 'Tanpa Mapel'); ?> (ID Mapel: <?php echo $t['id_mapel']; ?>)
-                                    </option>
-                                <?php endforeach; ?>
-                            <?php endif; ?>
-                        </select>
-                    </div>
-                    <div class="form-group">
-                        <label>NIS</label>
-                        <input type="text" name="nis" placeholder="Contoh: 12345"
-                               value="<?php echo htmlspecialchars($session_nis ?? ''); ?>" readonly>
-                    </div>
-                    <div class="form-group">
-                        <label>Nama Pengumpul</label>
-                        <input type="text" name="nama_siswa" required placeholder="Nama siswa"
-                               value="<?php echo htmlspecialchars($session_nama); ?>" readonly>
-                    </div>
-                </div>
-                
-                <div class="dropzone" onclick="document.getElementById('f-file').click();">
-                    <div id="dz-label"><strong>Klik untuk pilih file</strong> (PDF maks. 4 MB)</div>
-                    <input type="file" id="f-file" name="file_pdf" accept="application/pdf" required style="display:none;" onchange="updateFileName(this)">
-                </div>
-                
-                <div style="margin-top:20px;">
-                    <button type="submit" name="kumpul_tugas" class="btn btn-primary">Kumpulkan Tugas</button>
-                </div>
-                <?php echo $kumpul_status; ?>
-            </form>
-        </div>
-        <?php endif; ?>
-
-        <!-- CARD 3: RIWAYAT / DAFTAR PENGUMPULAN -->
-        <div class="content-box">
-            <div class="section-title"><?php echo $nav_role === 'siswa' ? 'Riwayat Pengumpulan Saya' : 'Daftar Pengumpulan Tugas Siswa'; ?></div>
-            <div class="section-sub"><?php echo count($submissions); ?> file <?php echo $nav_role === 'siswa' ? 'telah kamu kumpulkan' : 'telah dikumpulkan siswa'; ?>.</div>
-            
-            <?php echo $nilai_status; ?>
-            
             <div class="table-responsive">
-                <table>
+                <table class="table-custom">
                     <thead>
                         <tr>
-                            <th>No</th>
-                            <th>Tugas</th>
-                            <th>Mapel (ID Mapel)</th>
-                            <th>NIS & Nama Siswa</th>
-                            <th>Waktu Kumpul & File</th>
-                            <th>Status</th>
-                            <th>Nilai</th>
-                            <th>Aksi File / Pengelolaan</th>
+                            <th>Mata Pelajaran</th>
+                            <th>Judul Tugas</th>
+                            <th>Batas Waktu (Deadline)</th>
+                            <th>Petunjuk / Deskripsi</th>
+                            <?php if ($nav_role === 'siswa'): ?>
+                                <th style="text-align: right;">Aksi</th>
+                            <?php endif; ?>
                         </tr>
                     </thead>
                     <tbody>
-                        <?php if (empty($submissions)): ?>
-                            <tr><td colspan="8" class="empty">Belum ada file yang dikumpulkan.</td></tr>
-                        <?php else: ?>
-                            <?php foreach ($submissions as $index => $s): ?>
+                        <?php if (!empty($tugas_list)): ?>
+                            <?php foreach ($tugas_list as $t): ?>
                                 <tr>
-                                    <td><?php echo $index + 1; ?></td>
-                                    <td><strong><?php echo htmlspecialchars($s['tugas_judul'] ?? '(tugas dihapus)'); ?></strong></td>
+                                    <td><span class="badge-pill badge-blue"><?php echo htmlspecialchars($t['nama_mapel'] ?: ($t['id_mapel'] ?: '-')); ?></span></td>
+                                    <td style="font-weight: 700; color: var(--text-title);"><?php echo htmlspecialchars($t['judul']); ?></td>
                                     <td>
-                                        <span class="badge badge-mapel">
-                                            <?php echo htmlspecialchars($s['nama_mapel'] ?? '-'); ?> 
-                                            <?php if(!empty($s['id_mapel'])): ?>(ID: <?php echo $s['id_mapel']; ?>)<?php endif; ?>
-                                        </span>
-                                    </td>
-                                    <td>
-                                        <strong><?php echo htmlspecialchars($s['nama_siswa']); ?></strong>
-                                        <?php if (!empty($s['nis'])): ?>
-                                            <br><span class="meta-line">NIS: <?php echo htmlspecialchars($s['nis']); ?></span>
-                                        <?php endif; ?>
-                                    </td>
-                                    <td>
-                                        <?php echo date('d M Y, H:i', strtotime($s['submitted_at'])); ?>
-                                        <div class="fname">
-                                            <span style="font-size:12px;">📄</span>
-                                            <span class="meta-line" style="color:var(--primary);"><?php echo htmlspecialchars($s['nama_file']); ?></span>
-                                        </div>
-                                    </td>
-                                    <td>
-                                        <span class="badge <?php echo ($s['status'] === 'Terlambat') ? 'badge-late' : 'badge-ontime'; ?>">
-                                            <?php echo htmlspecialchars($s['status']); ?>
-                                        </span>
-                                    </td>
-                                    <td>
-                                        <?php if ($nav_role === 'admin' || $nav_role === 'guru'): ?>
-                                            <form action="tugas.php" method="POST" class="nilai-form">
-                                                <?php echo csrf_field(); ?>
-                                                <input type="hidden" name="id_pengumpulan" value="<?php echo $s['id_pengumpulan']; ?>">
-                                                <input type="number" name="nilai" min="0" max="100" placeholder="0-100" value="<?php echo htmlspecialchars($s['nilai'] ?? ''); ?>">
-                                                <button type="submit" name="update_nilai" class="btn btn-blue">Simpan</button>
-                                            </form>
+                                        <?php if (!empty($t['deadline'])): ?>
+                                            📅 <?php echo date('d M Y', strtotime($t['deadline'])); ?>
                                         <?php else: ?>
-                                            <?php if ($s['nilai'] !== null && $s['nilai'] !== ''): ?>
-                                                <span class="badge-nilai"><?php echo htmlspecialchars($s['nilai']); ?></span>
-                                            <?php else: ?>
-                                                <span class="meta-line">Belum dinilai</span>
-                                            <?php endif; ?>
+                                            <span style="color: var(--text-muted);">Tidak ada batas waktu</span>
                                         <?php endif; ?>
                                     </td>
-                                    <td>
-                                        <!-- Tombol Preview PDF Tanpa Download -->
-                                        <a href="<?php echo htmlspecialchars($s['path_file']); ?>" download class="btn btn-blue" style="margin-left: 2px;">Unduh</a>
-                                        <button type="button" class="btn btn-green"
-                                            onclick="openPreview(
-                                                'preview_pdf.php?file=<?php echo urlencode(basename($s['path_file'])); ?>',
-                                                '<?php echo htmlspecialchars($s['nama_file']); ?>'
-                                            )">
-                                            Lihat
-                                        </button>
-                                        <?php if ($nav_role !== 'siswa'): ?>
-                                            <form action="tugas.php" method="POST" style="display:inline;" onsubmit="return confirm('Hapus file ini?');">
-                                                <?php echo csrf_field(); ?>
-                                                <input type="hidden" name="action" value="delete">
-                                                <input type="hidden" name="id" value="<?php echo e($s['id_pengumpulan']); ?>">
-                                                <button type="submit" class="btn btn-red" style="margin-left: 2px;">Hapus</button>
-                                            </form>
-                                        <?php endif; ?>
-                                    </td>
+                                    <td style="color: var(--text-muted); font-size: 12.5px;"><?php echo htmlspecialchars($t['deskripsi'] ?: '-'); ?></td>
+                                    <?php if ($nav_role === 'siswa'): ?>
+                                        <td style="text-align: right; white-space: nowrap;">
+                                            <button type="button" class="btn-tbl btn-tbl-view" onclick="openSubmitTaskModal(<?php echo (int)$t['id_tugas']; ?>)">
+                                                📤 Kumpul
+                                            </button>
+                                        </td>
+                                    <?php endif; ?>
                                 </tr>
                             <?php endforeach; ?>
+                        <?php else: ?>
+                            <tr>
+                                <td colspan="<?php echo ($nav_role === 'siswa') ? '5' : '4'; ?>" style="text-align: center; padding: 24px; color: var(--text-muted);">
+                                    Belum ada tugas yang diterbitkan.
+                                </td>
+                            </tr>
                         <?php endif; ?>
                     </tbody>
                 </table>
             </div>
         </div>
 
+        <!-- DAFTAR PENGUMPULAN TUGAS & PENILAIAN -->
+        <div class="content-box">
+            <h3 class="section-title">
+                <span><?php echo ($nav_role === 'siswa') ? '📊 Riwayat Pengumpulan & Nilai Saya' : '📊 Rekap Pengumpulan & Penilaian Tugas Siswa'; ?></span>
+            </h3>
+
+            <div class="table-responsive">
+                <table class="table-custom">
+                    <thead>
+                        <tr>
+                            <th>Siswa</th>
+                            <th>Tugas & Mapel</th>
+                            <th>Waktu Kirim</th>
+                            <th>Status Deadline</th>
+                            <th>Berkas PDF</th>
+                            <th>Nilai</th>
+                            <?php if ($nav_role === 'admin' || $nav_role === 'guru'): ?>
+                                <th style="text-align: right;">Aksi</th>
+                            <?php endif; ?>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php if (!empty($submissions)): ?>
+                            <?php foreach ($submissions as $sub): ?>
+                                <tr>
+                                    <td>
+                                        <div style="font-weight: 700; color: var(--text-title);"><?php echo htmlspecialchars($sub['nama_siswa']); ?></div>
+                                        <div style="font-size: 11px; color: var(--text-muted);">NIS: <?php echo htmlspecialchars($sub['nis'] ?: '-'); ?></div>
+                                    </td>
+                                    <td>
+                                        <div style="font-weight: 700; color: var(--primary);"><?php echo htmlspecialchars($sub['tugas_judul'] ?: 'Tugas #' . $sub['id_tugas']); ?></div>
+                                        <div style="font-size: 11px; color: var(--text-muted);"><?php echo htmlspecialchars($sub['nama_mapel'] ?: '-'); ?></div>
+                                    </td>
+                                    <td style="font-size: 12px; color: var(--text-muted);"><?php echo htmlspecialchars($sub['submitted_at'] ?? '-'); ?></td>
+                                    <td>
+                                        <?php if ($sub['status'] === 'Tepat Waktu'): ?>
+                                            <span class="badge-pill badge-ontime">✓ Tepat Waktu</span>
+                                        <?php else: ?>
+                                            <span class="badge-pill badge-late">⚠️ Terlambat</span>
+                                        <?php endif; ?>
+                                    </td>
+                                    <td>
+                                        <button type="button" class="btn-tbl btn-tbl-view" 
+                                            onclick="openPdfModal('<?php echo htmlspecialchars(addslashes($sub['path_file'])); ?>', '<?php echo htmlspecialchars(addslashes($sub['tugas_judul'] ?: 'Berkas Tugas')); ?>')">
+                                            📄 <?php echo htmlspecialchars($sub['nama_file'] ?: 'Buka PDF'); ?>
+                                        </button>
+                                    </td>
+                                    <td>
+                                        <?php if ($sub['nilai'] !== null && $sub['nilai'] !== ''): ?>
+                                            <span style="font-size: 15px; font-weight: 800; color: var(--accent);"><?php echo htmlspecialchars($sub['nilai']); ?></span> / 100
+                                        <?php else: ?>
+                                            <span style="color: var(--text-muted); font-style: italic;">Belum Dinilai</span>
+                                        <?php endif; ?>
+                                    </td>
+                                    <?php if ($nav_role === 'admin' || $nav_role === 'guru'): ?>
+                                        <td style="text-align: right; white-space: nowrap;">
+                                            <form action="tugas.php" method="POST" style="display: inline-flex; align-items: center; gap: 6px;">
+                                                <?php echo csrf_field(); ?>
+                                                <input type="hidden" name="id_pengumpulan" value="<?php echo htmlspecialchars($sub['id_pengumpulan']); ?>">
+                                                <input type="number" name="nilai" min="0" max="100" class="form-control" style="width: 65px; height: 32px; padding: 0 6px; text-align: center;" placeholder="0-100" value="<?php echo htmlspecialchars($sub['nilai'] ?? ''); ?>" required>
+                                                <button type="submit" name="update_nilai" class="btn-tbl btn-tbl-view" style="height: 32px;">💾 Simpan</button>
+                                            </form>
+
+                                            <?php if ($nav_role === 'admin'): ?>
+                                                <button type="button" class="btn-tbl btn-tbl-delete" style="height: 32px;"
+                                                    onclick="openDeleteSubmissionModal('<?php echo htmlspecialchars($sub['id_pengumpulan']); ?>', '<?php echo htmlspecialchars(addslashes($sub['nama_siswa'])); ?>')">
+                                                    🗑️
+                                                </button>
+                                            <?php endif; ?>
+                                        </td>
+                                    <?php endif; ?>
+                                </tr>
+                            <?php endforeach; ?>
+                        <?php else: ?>
+                            <tr>
+                                <td colspan="7" style="text-align: center; padding: 24px; color: var(--text-muted);">
+                                    Belum ada berkas pengumpulan tugas yang tercatat.
+                                </td>
+                            </tr>
+                        <?php endif; ?>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+    </main>
+
+    <!-- ===== MODAL TERBITKAN TUGAS BARU (ADMIN & GURU) ===== -->
+    <div id="modal-create-task" class="modal-overlay">
+        <div class="modal-card">
+            <div class="modal-header">
+                <h3>➕ Buat & Terbitkan Tugas Baru</h3>
+                <button type="button" class="modal-close-btn" onclick="closeModal('modal-create-task')">✕</button>
+            </div>
+            <form action="tugas.php" method="POST">
+                <?php echo csrf_field(); ?>
+
+                <div class="modal-body">
+                    <div class="form-grid-modal">
+                        <div class="form-group-modal">
+                            <label class="form-label">Mata Pelajaran</label>
+                            <select name="id_mapel" class="form-control" required>
+                                <option value="">-- Pilih Mata Pelajaran --</option>
+                                <?php foreach ($mapel_list as $m): ?>
+                                    <option value="<?php echo htmlspecialchars($m['id_mapel']); ?>">
+                                        <?php echo htmlspecialchars($m['nama_mapel']); ?> (<?php echo htmlspecialchars($m['id_mapel']); ?>)
+                                    </option>
+                                <?php endforeach; ?>
+                            </select>
+                        </div>
+
+                        <div class="form-group-modal">
+                            <label class="form-label">Batas Waktu (Deadline)</label>
+                            <input type="date" name="deadline" class="form-control">
+                        </div>
+
+                        <div class="form-group-modal full">
+                            <label class="form-label">Judul Tugas</label>
+                            <input type="text" name="judul" class="form-control" required placeholder="Contoh: Latihan 3 - Persamaan Kuadrat">
+                        </div>
+
+                        <div class="form-group-modal full">
+                            <label class="form-label">Deskripsi / Petunjuk Pengerjaan</label>
+                            <textarea name="deskripsi" class="form-control" placeholder="Tuliskan petunjuk pengerjaan tugas di sini..."></textarea>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="modal-footer">
+                    <button type="button" class="btn-action btn-secondary" onclick="closeModal('modal-create-task')">Batal</button>
+                    <button type="submit" name="buat_tugas" class="btn-action btn-primary">🚀 Terbitkan Tugas</button>
+                </div>
+            </form>
+        </div>
     </div>
 
-    <!-- MODAL POPUP UNTUK PREVIEW PDF -->
-    <div id="pdfModal" class="modal">
-        <div class="modal-content">
+    <!-- ===== MODAL KUMPULKAN TUGAS (SISWA) ===== -->
+    <div id="modal-submit-task" class="modal-overlay">
+        <div class="modal-card">
             <div class="modal-header">
-                <h3 id="modalTitle">Preview File PDF</h3>
-                <span class="close-btn" onclick="closePreview()">&times;</span>
+                <h3>📤 Kumpulkan Berkas Tugas (Format PDF)</h3>
+                <button type="button" class="modal-close-btn" onclick="closeModal('modal-submit-task')">✕</button>
             </div>
-            <div class="modal-body">
-                <iframe id="pdfFrame" src="" frameborder="0"></iframe>
+            <form action="tugas.php" method="POST" enctype="multipart/form-data">
+                <?php echo csrf_field(); ?>
+
+                <div class="modal-body">
+                    <div class="form-group-modal">
+                        <label class="form-label">Pilih Tugas</label>
+                        <select name="id_tugas" id="submit-tugas-select" class="form-control" required>
+                            <option value="">-- Pilih Tugas --</option>
+                            <?php foreach ($tugas_list as $t): ?>
+                                <option value="<?php echo htmlspecialchars($t['id_tugas']); ?>">
+                                    <?php echo htmlspecialchars($t['judul']); ?> (<?php echo htmlspecialchars($t['nama_mapel']); ?>)
+                                </option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+
+                    <div class="form-group-modal">
+                        <label class="form-label">Identitas Siswa</label>
+                        <input type="text" class="form-control" value="<?php echo htmlspecialchars($session_nama); ?> (NIS: <?php echo htmlspecialchars($session_nis ?: '-'); ?>)" disabled style="background:#f1f5f9;">
+                    </div>
+
+                    <div class="form-group-modal">
+                        <label class="form-label">Berkas Tugas (PDF Maks 5MB)</label>
+                        <input type="file" name="file_pdf" class="form-control" accept="application/pdf" required style="padding-top: 6px;">
+                    </div>
+                </div>
+
+                <div class="modal-footer">
+                    <button type="button" class="btn-action btn-secondary" onclick="closeModal('modal-submit-task')">Batal</button>
+                    <button type="submit" name="kumpul_tugas" class="btn-action btn-primary">📤 Kirim Berkas Tugas</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- ===== MODAL HAPUS PENGUMPULAN (ADMIN) ===== -->
+    <div id="modal-delete-submission" class="modal-overlay">
+        <div class="modal-card modal-card-sm">
+            <div class="modal-header">
+                <h3>🗑️ Hapus Pengumpulan</h3>
+                <button type="button" class="modal-close-btn" onclick="closeModal('modal-delete-submission')">✕</button>
+            </div>
+            <form action="tugas.php" method="POST">
+                <?php echo csrf_field(); ?>
+                <input type="hidden" name="action" value="delete_submission">
+                <input type="hidden" name="id" id="del-sub-id">
+
+                <div class="modal-body" style="text-align: center;">
+                    <div style="font-size: 40px; margin-bottom: 10px;">⚠️</div>
+                    <p style="font-size: 14px; color: var(--text-title); font-weight: 700; margin-bottom: 6px;">
+                        Hapus pengumpulan tugas siswa ini?
+                    </p>
+                    <p style="font-size: 13px; color: var(--text-muted);" id="del-sub-name">-</p>
+                </div>
+
+                <div class="modal-footer" style="justify-content: center;">
+                    <button type="button" class="btn-action btn-secondary" onclick="closeModal('modal-delete-submission')">Batal</button>
+                    <button type="submit" class="btn-action" style="background: var(--accent-rose); color: #fff;">Ya, Hapus</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- ===== MODAL POPUP PDF PREVIEW ===== -->
+    <div id="modal-pdf" class="modal-overlay">
+        <div class="modal-card modal-card-lg">
+            <div class="modal-header">
+                <h3 id="pdf-title">📄 Preview PDF</h3>
+                <button type="button" class="modal-close-btn" onclick="closeModal('modal-pdf')">✕</button>
+            </div>
+            <div class="modal-body" style="padding: 0;">
+                <iframe id="pdf-iframe" src="" style="width: 100%; height: 75vh; border: none;"></iframe>
             </div>
         </div>
     </div>
 
     <script>
-        function updateFileName(input) {
-            const label = document.getElementById('dz-label');
-            if (input.files && input.files[0]) {
-                const file = input.files[0];
-                if (file.type !== 'application/pdf') {
-                    alert('File harus berformat PDF!');
-                    input.value = '';
-                    label.innerHTML = '<strong>Klik untuk pilih file</strong> (PDF maks. 4 MB)';
-                    return;
-                }
-                label.innerHTML = `<strong>${file.name}</strong> (${(file.size/1024).toFixed(0)} KB)`;
+        function openCreateTaskModal() {
+            document.getElementById('modal-create-task').classList.add('active');
+        }
+
+        function openSubmitTaskModal(preselectedId) {
+            var select = document.getElementById('submit-tugas-select');
+            if (preselectedId) {
+                select.value = preselectedId;
+            }
+            document.getElementById('modal-submit-task').classList.add('active');
+        }
+
+        function openDeleteSubmissionModal(id, studentName) {
+            document.getElementById('del-sub-id').value = id;
+            document.getElementById('del-sub-name').innerText = 'Siswa: ' + studentName;
+            document.getElementById('modal-delete-submission').classList.add('active');
+        }
+
+        function openPdfModal(filePath, title) {
+            document.getElementById('pdf-title').innerHTML = '📄 ' + title;
+            document.getElementById('pdf-iframe').src = filePath;
+            document.getElementById('modal-pdf').classList.add('active');
+        }
+
+        function toggleSidebar() {
+            document.getElementById('navbarMenu').classList.toggle('active');
+            document.getElementById('navBackdrop').classList.toggle('active');
+        }
+
+        function closeSidebar() {
+            document.getElementById('navbarMenu').classList.remove('active');
+            document.getElementById('navBackdrop').classList.remove('active');
+        }
+
+        function closeModal(id) {
+            document.getElementById(id).classList.remove('active');
+            if (id === 'modal-pdf') {
+                document.getElementById('pdf-iframe').src = '';
             }
         }
 
-        function openPreview(url, fileName) {
-            document.getElementById('modalTitle').textContent = 'Preview: ' + fileName;
-            document.getElementById('pdfModal').style.display = 'flex';
-
-            // Tambahkan timestamp supaya browser tidak pakai cache lama
-            const cacheBuster = (url.includes('?') ? '&' : '?') + '_t=' + Date.now();
-            document.getElementById('pdfFrame').src = url + cacheBuster;
+        window.onclick = function(e) {
+            if (e.target.classList.contains('modal-overlay')) {
+                if (e.target.id === 'modal-pdf') {
+                    document.getElementById('pdf-iframe').src = '';
+                }
+                e.target.classList.remove('active');
+            }
         }
-
-        function closePreview() {
-            const modal = document.getElementById('pdfModal');
-            const iframe = document.getElementById('pdfFrame');
-            iframe.src = '';
-            modal.style.display = 'none';
-        }
-
-        // Tutup modal jika klik di luar kotak modal
-        window.onclick = function(event) {
-            const modal = document.getElementById('pdfModal');
-            if (event.target == modal) {
-                closePreview();
+        window.onkeydown = function(e) {
+            if (e.key === 'Escape') {
+                document.querySelectorAll('.modal-overlay').forEach(function(m) {
+                    m.classList.remove('active');
+                });
+                document.getElementById('pdf-iframe').src = '';
             }
         }
     </script>
+
 </body>
 </html>
